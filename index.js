@@ -1,0 +1,2073 @@
+const path = require('path');
+require('dotenv').config({ path: path.join(__dirname, '.env') });
+
+const { MongoClient, ObjectId } = require('mongodb');
+const express = require('express');
+const cors = require('cors');
+const { rateLimit } = require('express-rate-limit');
+const { getBetterAuthSessionToken } = require('./lib/better-auth-session');
+const {
+  createCheckoutSession,
+  getCheckoutConfig,
+  getPrice,
+  getStripe,
+  webhookSecret,
+} = require('./lib/stripe');
+const {
+  YEARLY_DISCOUNT,
+  USD_TO_BDT,
+  FREE_PLAN_APPLICATION_LIMIT,
+  getPlan,
+  getPlanList,
+} = require('./lib/plans');
+
+const { version } = require('./package.json');
+
+const app = express();
+const PORT = process.env.PORT || 5000;
+const client = new MongoClient(process.env.MONGODB_URI || 'mongodb://localhost:27017');
+const dbName = process.env.DB_NAME || 'hireloopdb';
+const jobsCollectionName = process.env.JOBS_COLLECTION || 'jobs';
+const savedJobsCollectionName = process.env.SAVED_JOBS_COLLECTION || 'savedJobs';
+const applicationsCollectionName = process.env.APPLICATIONS_COLLECTION || 'applications';
+const paymentsCollectionName = process.env.PAYMENTS_COLLECTION || 'payments';
+
+const defaultAllowedOrigins = [
+  'http://localhost:3000',
+  'http://localhost:5173',
+  'http://127.0.0.1:3000',
+  'http://127.0.0.1:5173',
+];
+
+const allowedOrigins = (process.env.CORS_ORIGIN || defaultAllowedOrigins.join(','))
+  .split(',')
+  .map((origin) => origin.trim())
+  .filter(Boolean);
+
+const corsOptions = {
+  origin(origin, callback) {
+    if (!origin || allowedOrigins.includes(origin)) {
+      callback(null, true);
+      return;
+    }
+
+    callback(new Error('Not allowed by CORS'));
+  },
+  credentials: true,
+  methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+};
+
+app.use(cors(corsOptions));
+app.options('/{*splat}', cors(corsOptions));
+
+/**
+ * Handles Stripe invoice events (invoice.paid / invoice.payment_failed) by
+ * keeping the payments ledger in sync with the billing state.
+ */
+async function recordInvoiceEvent(invoice, eventType) {
+  const now = new Date();
+  const status =
+    eventType === 'invoice.paid'
+      ? 'success'
+      : eventType === 'invoice.payment_failed'
+        ? 'failed'
+        : 'pending';
+  const customerId = invoice.customer?.id ?? null;
+  let userId = null;
+
+  if (customerId) {
+    try {
+      const customer = await getStripe().customers.retrieve(customerId, {
+        expand: ['metadata'],
+      });
+      userId = customer.metadata?.userId ?? null;
+    } catch (err) {
+      console.error('invoice customer retrieve error:', err?.message ?? err);
+    }
+  }
+
+  const doc = {
+    provider: 'stripe',
+    transactionId: invoice.id,
+    paymentIntentId: invoice.payment_intent ? String(invoice.payment_intent) : null,
+    userId,
+    userName: null,
+    userEmail: invoice.customer_email || null,
+    stripeCustomerId: customerId,
+    subscriptionId: invoice.subscription || null,
+    plan: invoice.metadata?.plan || null,
+    planName: invoice.metadata?.planName || null,
+    billing: invoice.metadata?.billing || null,
+    interval:
+      invoice.metadata?.billing === 'yearly'
+        ? 'year'
+        : invoice.metadata?.billing === 'monthly'
+          ? 'month'
+          : null,
+    amount: invoice.amount_paid ?? invoice.amount_due ?? 0,
+    currency: String(invoice.currency ?? 'USD').toUpperCase(),
+    status,
+    receiptUrl: invoice.hosted_invoice_url || invoice.invoice_url || null,
+    stripeStatus: invoice.status,
+    updatedAt: now,
+  };
+
+  await client
+    .db(dbName)
+    .collection(paymentsCollectionName)
+    .updateOne(
+      { transactionId: invoice.id },
+      { $set: doc, $setOnInsert: { createdAt: now } },
+      { upsert: true },
+    );
+}
+
+/**
+ * Handles Stripe subscription lifecycle events (customer.subscription.updated /
+ * customer.subscription.deleted) so the plan status stays in sync.
+ */
+async function applySubscriptionState(subscription) {
+  const customerId = subscription.customer?.id ?? null;
+  const userId = subscription.metadata?.userId ?? null;
+  const db = client.db(dbName);
+  const filter = userId ? { userId } : customerId ? { stripeCustomerId: customerId } : {};
+  const latest = await db
+    .collection(paymentsCollectionName)
+    .findOne(filter, { sort: { createdAt: -1 } });
+
+  if (!latest) return;
+
+  await db.collection(paymentsCollectionName).updateOne(
+    { transactionId: latest.transactionId },
+    {
+      $set: {
+        subscriptionId: subscription.id,
+        status: subscription.status === 'canceled' ? 'canceled' : 'success',
+        cancelAtPeriodEnd: Boolean(subscription.cancel_at_period_end),
+        updatedAt: new Date(),
+      },
+    },
+  );
+}
+
+/**
+ * POST /api/checkout/webhook
+ * Stripe webhook endpoint. Registered before the JSON body parser so the raw
+ * payload is available for signature verification.
+ */
+app.post(
+  '/api/checkout/webhook',
+  express.raw({ type: 'application/json' }),
+  async (req, res) => {
+    try {
+      if (!webhookSecret) {
+        return res
+          .status(503)
+          .json({ error: 'Stripe webhook secret is not configured' });
+      }
+
+      const signature = req.headers['stripe-signature'];
+      let event;
+      try {
+        event = getStripe().webhooks.constructEvent(
+          req.body,
+          signature,
+          webhookSecret,
+        );
+      } catch (err) {
+        console.error('Stripe webhook signature error:', err?.message ?? err);
+        return res.status(400).json({ error: 'Invalid Stripe signature' });
+      }
+
+      const handledEvents = new Set([
+        'payment_intent.succeeded',
+        'payment_intent.payment_failed',
+        'payment_intent.canceled',
+        'checkout.session.completed',
+        'checkout.session.failed',
+        'invoice.paid',
+        'invoice.payment_failed',
+        'customer.subscription.updated',
+        'customer.subscription.deleted',
+      ]);
+      if (handledEvents.has(event.type) && event.data?.object) {
+        if (event.type === 'checkout.session.completed') {
+          await recordCheckoutSession(event.data.object);
+        } else if (event.type === 'invoice.paid' || event.type === 'invoice.payment_failed') {
+          await recordInvoiceEvent(event.data.object, event.type);
+        } else if (
+          event.type === 'customer.subscription.updated' ||
+          event.type === 'customer.subscription.deleted'
+        ) {
+          await applySubscriptionState(event.data.object);
+        } else {
+          await recordPaymentIntent(event.data.object);
+        }
+      }
+
+      return res.json({ received: true });
+    } catch (err) {
+      console.error('Stripe webhook error:', err?.message ?? err);
+      return res.status(500).json({ error: 'Webhook handler failed' });
+    }
+  },
+);
+
+app.use(express.json());
+
+const checkoutLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 20,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: { error: 'Too many checkout attempts. Please try again shortly.' },
+});
+
+async function resolveSessionUserFromReq(req, db) {
+  const token = getBetterAuthSessionToken(
+    req.headers.cookie,
+    req.headers.authorization,
+    process.env.BETTER_AUTH_SECRET,
+  );
+  if (!token) return null;
+
+  const session = await db.collection('session').findOne({
+    token,
+    expiresAt: { $gt: new Date() },
+  });
+  if (!session?.userId) return null;
+
+  return db.collection('user').findOne({
+    $or: [
+      { _id: session.userId },
+      ...(ObjectId.isValid(String(session.userId))
+        ? [{ _id: new ObjectId(String(session.userId)) }]
+        : []),
+      { id: String(session.userId) },
+    ],
+  });
+}
+
+async function resolveUserFromReq(req, db) {
+  const sessionUser = await resolveSessionUserFromReq(req, db);
+  if (sessionUser) return sessionUser;
+
+  // Legacy userId-based lookup remains for existing non-job API consumers.
+  const rawUserId = req.query.userId || req.body?.userId;
+  if (!rawUserId) return null;
+  return db.collection('user').findOne({
+    $or: [
+      { _id: rawUserId },
+      ...(ObjectId.isValid(String(rawUserId))
+        ? [{ _id: new ObjectId(String(rawUserId)) }]
+        : []),
+      { id: String(rawUserId) },
+    ],
+  });
+}
+
+async function optionalAuth(req, res, next) {
+  try {
+    const db = client.db(dbName);
+    req.user = await resolveUserFromReq(req, db);
+  } catch (err) {
+    console.error('optionalAuth error:', err);
+    req.user = null;
+  }
+  next();
+}
+
+async function requireSessionAuth(req, res, next) {
+  try {
+    req.user = await resolveSessionUserFromReq(req, client.db(dbName));
+    if (!req.user) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
+    return next();
+  } catch (err) {
+    console.error('Session authentication failed:', err?.message ?? err);
+    return res.status(500).json({ error: 'Could not verify session' });
+  }
+}
+
+app.get('/', (req, res) => {
+  res.status(200).json({
+    name: 'hireloop API',
+    status: 'running',
+    version,
+    message: 'hireloop API is running',
+    time: new Date().toISOString(),
+  });
+});
+
+app.get('/health', async (req, res) => {
+  try {
+    await client.db('admin').command({ ping: 1 });
+    res.status(200).json({ status: 'ok' });
+  } catch (err) {
+    res.status(503).json({ status: 'error' });
+  }
+});
+
+function paymentStatusFromIntent(intent) {
+  if (intent.status === 'succeeded') return 'success';
+  if (intent.status === 'canceled' || intent.last_payment_error) return 'failed';
+  return 'pending';
+}
+
+async function recordPaymentIntent(intent, user = null) {
+  const now = new Date();
+  const status = paymentStatusFromIntent(intent);
+  const userId = user
+    ? String(user._id ?? user.id)
+    : intent.metadata?.userId || null;
+  const userEmail =
+    intent.receipt_email || intent.metadata?.email || user?.email || null;
+
+  await client
+    .db(dbName)
+    .collection(paymentsCollectionName)
+    .updateOne(
+      { transactionId: intent.id },
+      {
+        $set: {
+          provider: 'stripe',
+          transactionId: intent.id,
+          paymentIntentId: intent.id,
+          userId,
+          userName: user?.name ?? null,
+          userEmail,
+          plan: intent.metadata?.plan || null,
+          planName:
+            intent.metadata?.planName || intent.description || null,
+          billing: intent.metadata?.billing || null,
+          amount: intent.amount,
+          currency: String(intent.currency ?? '').toUpperCase(),
+          status,
+          stripeStatus: intent.status,
+          updatedAt: now,
+        },
+        $setOnInsert: { createdAt: now },
+      },
+      { upsert: true },
+    );
+
+  return {
+    status,
+    stripeStatus: intent.status,
+    amount: intent.amount,
+    currency: String(intent.currency ?? '').toUpperCase(),
+  };
+}
+
+/**
+ * GET /api/plans
+ * Pricing plans for the public pricing section.
+ */
+app.get('/api/plans', (_req, res) => {
+  res.json({
+    data: {
+      usdToBdt: USD_TO_BDT,
+      yearlyDiscount: YEARLY_DISCOUNT,
+      plans: getPlanList(),
+    },
+  });
+});
+
+/**
+ * GET /api/checkout/config
+ * Public checkout settings for a plan: Stripe publishable key, plan and prices.
+ */
+app.get('/api/checkout/config', (req, res) => {
+  const config = getCheckoutConfig({
+    planId: req.query.plan,
+    billing: req.query.billing,
+  });
+
+  if (!config) {
+    return res.status(404).json({ error: 'Plan not found' });
+  }
+
+  return res.json({ data: config });
+});
+
+/**
+ * POST /api/checkout/payment-intent
+ * Creates a Stripe PaymentIntent for the selected plan and currency. The
+ * amount is always decided on the server; the client only sends identifiers.
+ */
+app.post('/api/checkout/payment-intent', checkoutLimiter, optionalAuth, async (req, res) => {
+  try {
+    const planId = req.body?.planId ?? req.query.plan ?? 'growth';
+    const billing = req.body?.billing ?? req.query.billing ?? 'monthly';
+    const config = getCheckoutConfig({ planId, billing });
+
+    if (!config) {
+      return res.status(404).json({ error: 'Plan not found' });
+    }
+    if (!config.stripeReady) {
+      return res.status(503).json({ error: 'Stripe is not configured on the server' });
+    }
+
+    const price = getPrice(req.body?.currency, planId, billing);
+    if (!price) {
+      return res.status(400).json({ error: 'Unsupported currency' });
+    }
+    if (price.amount <= 0) {
+      return res.status(400).json({ error: 'This plan is free — no payment is required' });
+    }
+
+    const email = String(req.body?.email ?? '').trim();
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ error: 'Enter a valid email address' });
+    }
+
+    const intent = await getStripe().paymentIntents.create({
+      amount: price.amount,
+      currency: price.currency.toLowerCase(),
+      automatic_payment_methods: { enabled: true },
+      ...(email ? { receipt_email: email } : {}),
+      description: `${config.plan.name} Plan - ${price.display}/${config.plan.interval}`,
+      metadata: {
+        plan: config.plan.id,
+        planName: config.plan.name,
+        billing: config.plan.billing,
+        displayPrice: price.display,
+        userId: req.user ? String(req.user._id ?? req.user.id) : '',
+        email,
+      },
+    });
+
+    return res.status(201).json({
+      data: {
+        id: intent.id,
+        clientSecret: intent.client_secret,
+        amount: price.amount,
+        currency: price.currency,
+        display: price.display,
+        planId: config.plan.id,
+        billing: config.plan.billing,
+        publishableKey: config.publishableKey,
+      },
+    });
+  } catch (err) {
+    console.error('POST payment-intent error:', err?.message ?? err);
+    const status =
+      err?.statusCode ??
+      (err?.type === 'StripeInvalidRequestError' ? 400 : 502);
+    return res
+      .status(status)
+      .json({ error: err?.message || 'Could not start checkout' });
+  }
+});
+
+/**
+ * POST /api/checkout/confirm
+ * Called after Stripe.js confirms the card payment. The intent is re-fetched
+ * from Stripe so the client cannot fake a successful payment.
+ */
+app.post('/api/checkout/confirm', checkoutLimiter, optionalAuth, async (req, res) => {
+  try {
+    const paymentIntentId = String(req.body?.paymentIntentId ?? '').trim();
+    if (!paymentIntentId.startsWith('pi_')) {
+      return res.status(400).json({ error: 'Invalid payment intent id' });
+    }
+
+    const intent = await getStripe().paymentIntents.retrieve(paymentIntentId);
+
+    const userId = req.user ? String(req.user._id ?? req.user.id) : null;
+    if (intent.metadata?.userId && userId && intent.metadata.userId !== userId) {
+      return res.status(403).json({ error: 'This payment belongs to another account' });
+    }
+
+    if (intent.status !== 'succeeded') {
+      await recordPaymentIntent(intent, req.user);
+      return res.status(409).json({
+        error: `Payment is ${intent.status}`,
+        status: intent.status,
+      });
+    }
+
+    const payment = await recordPaymentIntent(intent, req.user);
+    return res.json({
+      data: { transactionId: intent.id, ...payment },
+    });
+  } catch (err) {
+    console.error('POST checkout confirm error:', err?.message ?? err);
+    const status =
+      err?.statusCode ??
+      (err?.type === 'StripeInvalidRequestError' ? 400 : 502);
+    return res
+      .status(status)
+      .json({ error: err?.message || 'Could not verify payment' });
+  }
+});
+
+/**
+ * GET /api/checkout/payments/:paymentIntentId
+ * Returns the stored checkout payment record (email + plan) for a
+ * payment-intent id.
+ */
+app.get('/api/checkout/payments/:paymentIntentId', async (req, res) => {
+  try {
+    const paymentIntentId = String(req.params.paymentIntentId ?? '').trim();
+    const isCheckoutSession = paymentIntentId.startsWith('cs_');
+    if (!paymentIntentId.startsWith('pi_') && !isCheckoutSession) {
+      return res.status(400).json({ error: 'Invalid payment intent id' });
+    }
+
+    const payment = await client
+      .db(dbName)
+      .collection(paymentsCollectionName)
+      .findOne({ transactionId: paymentIntentId });
+
+    if (payment) {
+      return res.json({
+        data: {
+          transactionId: payment.transactionId,
+          userEmail: payment.userEmail ?? null,
+          plan: payment.plan ?? null,
+          planName: payment.planName ?? null,
+          billing: payment.billing ?? null,
+          interval: payment.interval ?? null,
+          amount: payment.amount ?? null,
+          currency: payment.currency ?? null,
+          status: payment.status ?? null,
+          stripeStatus: payment.stripeStatus ?? null,
+          createdAt: payment.createdAt
+            ? new Date(payment.createdAt).toISOString()
+            : null,
+        },
+      });
+    }
+
+    // Hosted Checkout Sessions that were not persisted yet — fall back to
+    // Stripe so the success screen can still render a confirmed payment.
+    if (isCheckoutSession) {
+      try {
+        const session = await getStripe().checkout.sessions.retrieve(paymentIntentId, {
+          expand: ['line_items', 'payment_intent', 'customer'],
+        });
+        const data = buildCheckoutSessionData(session, null);
+        return res.json({ data });
+      } catch (sessionErr) {
+        console.error('GET checkout session fallback error:', sessionErr?.message ?? sessionErr);
+      }
+    }
+
+    return res.status(404).json({ error: 'Payment not found' });
+  } catch (err) {
+    console.error('GET checkout payment error:', err?.message ?? err);
+    const status =
+      err?.statusCode ??
+      (err?.type === 'StripeInvalidRequestError' ? 400 : 502);
+    return res
+      .status(status)
+      .json({ error: err?.message || 'Could not load payment' });
+  }
+});
+
+/**
+ * Normalizes a Stripe Checkout Session into the payment/plan fields used by
+ * the success screen and the payments ledger. Stripe is the source of truth.
+ */
+function buildCheckoutSessionData(session, user = null) {
+  const paid = session.payment_status === 'paid';
+  const metadata = session.metadata || {};
+  const billing = metadata.billing || null;
+
+  return {
+    id: session.id,
+    transactionId: session.id,
+    paymentIntentId: session.payment_intent ? String(session.payment_intent) : null,
+    url: session.url || null,
+    amount: session.amount_total ?? 0,
+    currency: String(session.currency ?? 'USD').toUpperCase(),
+    status: paid ? 'success' : String(session.payment_status || 'pending'),
+    stripeStatus: session.status,
+    customerEmail:
+      session.customer_details?.email ||
+      session.customer_email ||
+      session.customer?.email ||
+      metadata.email ||
+      user?.email ||
+      null,
+    plan: metadata.plan || null,
+    planName: metadata.planName || null,
+    billing,
+    interval: billing === 'yearly' ? 'year' : billing === 'monthly' ? 'month' : null,
+    receiptUrl: session.receipt_url || null,
+    createdAt: session.created_at ? new Date(session.created_at * 1000).toISOString() : null,
+  };
+}
+
+async function recordCheckoutSession(session, user = null) {
+  const now = new Date();
+  const status =
+    session.payment_status === 'paid' || session.status === 'complete'
+      ? 'success'
+      : 'pending';
+
+  const payment = {
+    provider: 'stripe',
+    transactionId: session.id,
+    paymentIntentId: session.payment_intent ? String(session.payment_intent) : null,
+    userId: user ? String(user._id ?? user.id) : session.metadata?.userId || null,
+    userName: user?.name ?? null,
+    userEmail:
+      session.customer_details?.email ||
+      session.customer_email ||
+      session.metadata?.email ||
+      null,
+    stripeCustomerId: typeof session.customer === 'string' ? session.customer : session.customer?.id ?? null,
+    subscriptionId: session.subscription ?? null,
+    plan: session.metadata?.plan || null,
+    planName: session.metadata?.planName || null,
+    billing: session.metadata?.billing || null,
+    interval:
+      session.metadata?.billing === 'yearly'
+        ? 'year'
+        : session.metadata?.billing === 'monthly'
+          ? 'month'
+          : null,
+    amount: session.amount_total ?? 0,
+    currency: String(session.currency ?? 'USD').toUpperCase(),
+    status,
+    stripeStatus: session.status,
+    receiptUrl: session.receipt_url || null,
+    updatedAt: now,
+  };
+
+  await client
+    .db(dbName)
+    .collection(paymentsCollectionName)
+    .updateOne(
+      { transactionId: session.id },
+      {
+        $set: payment,
+        $setOnInsert: { createdAt: now },
+      },
+      { upsert: true },
+    );
+
+  const data = buildCheckoutSessionData(session, user);
+
+  return {
+    status: data.status,
+    stripeStatus: data.stripeStatus,
+    amount: data.amount,
+    currency: data.currency,
+    transactionId: data.transactionId,
+    paymentIntentId: data.paymentIntentId,
+    customerEmail: data.customerEmail,
+    plan: data.plan,
+    planName: data.planName,
+    billing: data.billing,
+    interval: data.interval,
+    receiptUrl: data.receiptUrl,
+  };
+}
+
+/**
+ * GET /api/checkout/session/:sessionId
+ * Retrieves a hosted Stripe Checkout Session by id and returns the payment +
+ * plan details for the success screen. Stripe is the source of truth.
+ */
+app.get('/api/checkout/session/:sessionId', optionalAuth, async (req, res) => {
+  try {
+    const sessionId = String(req.params.sessionId ?? '').trim();
+    if (!sessionId.startsWith('cs_')) {
+      return res.status(400).json({ error: 'Invalid checkout session id' });
+    }
+
+    const session = await getStripe().checkout.sessions.retrieve(sessionId, {
+      expand: ['line_items', 'payment_intent', 'customer'],
+    });
+
+    if (session.payment_status === 'paid' || session.status === 'complete') {
+      try {
+        await recordCheckoutSession(session, req.user || null);
+      } catch (recErr) {
+        console.error('recordCheckoutSession from GET error:', recErr?.message ?? recErr);
+      }
+    }
+
+    const data = buildCheckoutSessionData(session, req.user || null);
+
+    return res.json({ data });
+  } catch (err) {
+    console.error('GET checkout session error:', err?.message ?? err);
+    const status =
+      err?.statusCode ??
+      (err?.type === 'StripeInvalidRequestError' ? 404 : 502);
+    return res.status(status).json({ error: err?.message || 'Could not load checkout session' });
+  }
+});
+
+/**
+ * POST /api/checkout/session
+ * Creates a hosted Stripe Checkout Session (full page) for a plan/billing pair.
+ */
+app.post('/api/checkout/session', checkoutLimiter, optionalAuth, async (req, res) => {
+  try {
+    const config = getCheckoutConfig({
+      planId: req.body?.planId,
+      billing: req.body?.billing,
+    });
+
+    if (!config) {
+      return res.status(404).json({ error: 'Plan not found' });
+    }
+
+    const planId = config.plan.id;
+    const billing = config.plan.billing;
+    const price = getPrice('USD', planId, billing);
+
+    if (!price) {
+      return res.status(400).json({ error: 'Unsupported currency' });
+    }
+    if (price.amount <= 0) {
+      return res.status(400).json({ error: 'This plan is free — no checkout required' });
+    }
+
+    const email = String(req.body?.email ?? '').trim();
+    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
+      return res.status(400).json({ error: 'Enter a valid email address' });
+    }
+
+    const userId = req.user ? String(req.user._id ?? req.user.id) : '';
+    const session = await createCheckoutSession({
+      planId,
+      billing,
+      email,
+      userId,
+    });
+
+    return res.status(201).json({
+      data: {
+        id: session.id,
+        url: session.url,
+        amount: session.amount,
+        currency: session.currency,
+        planId: session.planId,
+        billing: session.billing,
+      },
+    });
+  } catch (err) {
+    try {
+      require("fs").writeFileSync(
+        process.cwd() + "/tmp-checkout-session-error.json",
+        JSON.stringify({ type: err?.type, message: err?.message, statusCode: err?.statusCode, stack: err?.stack }),
+      );
+    } catch {}
+    console.error('POST checkout session error:', err?.message ?? err);
+    const status =
+      err?.statusCode ??
+      (err?.type === 'StripeInvalidRequestError' ? 400 : 502);
+    return res
+      .status(status)
+      .json({ error: err?.message || 'Could not create checkout session' });
+  }
+});
+
+/**
+ * GET /api/billing/summary
+ * Current plan, billing status, renewal date and payment method for the
+ * logged-in user. Reads the payments ledger first, then enriches with Stripe.
+ */
+app.get('/api/billing/summary', optionalAuth, async (req, res) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
+
+    const userId = String(req.user._id ?? req.user.id);
+    const db = client.db(dbName);
+
+    const userIds = [userId];
+    if (ObjectId.isValid(userId)) {
+      userIds.push(new ObjectId(userId));
+    }
+    const userOrEmailFilter = {
+      $or: [
+        { userId: { $in: userIds } },
+        ...(req.user.email
+          ? [
+              { userEmail: req.user.email },
+              { customerEmail: req.user.email },
+              { 'metadata.email': req.user.email },
+            ]
+          : []),
+      ],
+    };
+
+    const latest = await db
+      .collection(paymentsCollectionName)
+      .findOne(userOrEmailFilter, { sort: { createdAt: -1 } });
+
+    let status = 'Active';
+    let renewalDate = null;
+    let cancelAtPeriodEnd = false;
+    let paymentMethod = null;
+    let stripeCustomerId = latest?.stripeCustomerId ?? null;
+
+    let currentPlan = null;
+
+    if (latest && latest.plan && latest.plan !== 'starter') {
+      const planConfig = getPlan(latest.plan);
+      const isYearly = latest.interval === 'year' || latest.billing === 'yearly';
+      let calculatedAmount = latest.amount ?? 0;
+      if (!calculatedAmount && planConfig) {
+        calculatedAmount = isYearly
+          ? getCheckoutPricing(planConfig, 'yearly').usdCents
+          : planConfig.monthlyPrice * 100;
+      }
+
+      currentPlan = {
+        id: latest.plan ?? null,
+        name: latest.planName ?? planConfig?.name ?? latest.plan ?? 'Pro',
+        interval: isYearly ? 'year' : 'month',
+        amount: calculatedAmount,
+        currency: String(latest.currency ?? 'USD').toUpperCase(),
+        status: latest.status ?? 'Active',
+        features: planConfig?.features ?? [
+          'Unlimited job applications',
+          'Premium job insights',
+          'Priority candidate badge',
+          'Direct recruiter messaging',
+        ],
+        isFree: false,
+      };
+
+      if (latest.subscriptionId) {
+        try {
+          const subscription = await getStripe().subscriptions.retrieve(latest.subscriptionId, {
+            expand: ['customer'],
+          });
+          renewalDate = subscription.current_period_end
+            ? new Date(subscription.current_period_end * 1000).toISOString()
+            : null;
+          cancelAtPeriodEnd = Boolean(subscription.cancel_at_period_end);
+          status =
+            subscription.status === 'canceled'
+              ? 'Canceled'
+              : subscription.status === 'past_due'
+                ? 'Past due'
+                : 'Active';
+        } catch (subErr) {
+          console.error('billing subscription retrieve error:', subErr?.message ?? subErr);
+          status = latest.status === 'failed' ? 'Past due' : 'Active';
+        }
+      } else if (latest.status) {
+        status = latest.status === 'success' ? 'Active' : latest.status === 'failed' ? 'Past due' : 'Pending';
+      }
+
+      // Calculate fallback renewal date (1 month or 1 year from payment)
+      if (!renewalDate && latest.createdAt) {
+        const nextDate = new Date(latest.createdAt);
+        if (isYearly) {
+          nextDate.setFullYear(nextDate.getFullYear() + 1);
+        } else {
+          nextDate.setMonth(nextDate.getMonth() + 1);
+        }
+        renewalDate = nextDate.toISOString();
+      }
+    } else {
+      const freePlan = getPlan('starter');
+      currentPlan = {
+        id: 'starter',
+        name: freePlan ? freePlan.name : 'Starter',
+        interval: 'month',
+        amount: 0,
+        currency: 'USD',
+        status: 'Active',
+        features: freePlan?.features ?? [
+          'Daily AI match brief (top 5)',
+          'Verified salary bands',
+          'Company insight dashboards',
+          '1-click apply, unlimited',
+        ],
+        isFree: true,
+      };
+      status = 'Active';
+    }
+
+    // Free plan application usage
+    const applicationCountForSummary = await db
+      .collection(applicationsCollectionName)
+      .countDocuments({
+        $or: [
+          { userId: { $in: userIds } },
+          { seekerId: { $in: userIds } },
+        ],
+      });
+    const isFreePlanForSummary = !currentPlan || currentPlan.id === 'starter';
+    const remainingApplications = isFreePlanForSummary
+      ? Math.max(0, FREE_PLAN_APPLICATION_LIMIT - applicationCountForSummary)
+      : null;
+
+    // Try finding Stripe customer if missing
+    if (!stripeCustomerId && req.user.email) {
+      try {
+        const customers = await getStripe().customers.list({
+          email: req.user.email,
+          limit: 1,
+        });
+        if (customers.data.length > 0) {
+          stripeCustomerId = customers.data[0].id;
+          if (latest) {
+            await db
+              .collection(paymentsCollectionName)
+              .updateOne({ _id: latest._id }, { $set: { stripeCustomerId } });
+          }
+        }
+      } catch (custErr) {
+        // Optional lookup
+      }
+    }
+
+    if (stripeCustomerId) {
+      try {
+        const customer = await getStripe().customers.retrieve(stripeCustomerId, {
+          expand: ['default_payment_method'],
+        });
+        let pm = customer.default_payment_method;
+        if (!pm) {
+          const pmList = await getStripe().paymentMethods.list({
+            customer: stripeCustomerId,
+            type: 'card',
+            limit: 1,
+          });
+          if (pmList.data.length > 0) {
+            pm = pmList.data[0];
+          }
+        }
+        if (pm) {
+          paymentMethod = {
+            brand: pm.card?.brand ?? pm.type ?? null,
+            last4: pm.card?.last4 ?? null,
+            expMonth: pm.card?.exp_month ?? null,
+            expYear: pm.card?.exp_year ?? null,
+          };
+        }
+      } catch (pmErr) {
+        console.error('billing payment method retrieve error:', pmErr?.message ?? pmErr);
+      }
+    }
+
+    return res.json({
+      data: {
+        currentPlan,
+        billingInterval: currentPlan?.interval ?? 'month',
+        price: currentPlan?.amount ?? 0,
+        currency: currentPlan?.currency ?? 'USD',
+        status,
+        renewalDate,
+        cancelAtPeriodEnd,
+        paymentMethod,
+        hasStripeCustomer: Boolean(stripeCustomerId),
+        stripeCustomerId,
+        freePlanApplicationLimit: isFreePlanForSummary ? FREE_PLAN_APPLICATION_LIMIT : null,
+        applicationCount: applicationCountForSummary,
+        remainingApplications,
+      },
+    });
+  } catch (err) {
+    console.error('GET billing summary error:', err?.message ?? err);
+    const status =
+      err?.statusCode ??
+      (err?.type === 'StripeInvalidRequestError' ? 502 : 500);
+    return res.status(status).json({ error: err?.message || 'Could not load billing summary' });
+  }
+});
+
+/**
+ * GET /api/billing/history
+ * Payment history for the logged-in user, newest first.
+ */
+app.get('/api/billing/history', optionalAuth, async (req, res) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
+
+    const userId = String(req.user._id ?? req.user.id);
+    const db = client.db(dbName);
+    const userIds = [userId];
+    if (ObjectId.isValid(userId)) {
+      userIds.push(new ObjectId(userId));
+    }
+    const userOrEmailFilter = {
+      $or: [
+        { userId: { $in: userIds } },
+        ...(req.user.email
+          ? [
+              { userEmail: req.user.email },
+              { customerEmail: req.user.email },
+              { 'metadata.email': req.user.email },
+            ]
+          : []),
+      ],
+    };
+
+    const docs = await db
+      .collection(paymentsCollectionName)
+      .find(userOrEmailFilter)
+      .sort({ createdAt: -1 })
+      .limit(50)
+      .toArray();
+
+    const statusMap = { success: 'paid', pending: 'pending', failed: 'failed' };
+    const history = docs.map((doc) => ({
+      id: doc.transactionId ?? (doc._id ? String(doc._id) : null),
+      date: doc.createdAt
+        ? new Date(doc.createdAt).toISOString()
+        : doc.updatedAt
+          ? new Date(doc.updatedAt).toISOString()
+          : null,
+      planName: doc.planName ?? doc.plan ?? 'Pro Plan',
+      interval: doc.interval ?? (doc.billing === 'yearly' ? 'year' : 'month'),
+      amount: doc.amount ?? 0,
+      currency: String(doc.currency ?? 'USD').toUpperCase(),
+      status: statusMap[doc.status] ?? doc.status ?? 'paid',
+      transactionId: doc.transactionId ?? null,
+      receiptUrl: doc.receiptUrl ?? null,
+    }));
+
+    return res.json({ data: history });
+  } catch (err) {
+    console.error('GET billing history error:', err?.message ?? err);
+    const status =
+      err?.statusCode ??
+      (err?.type === 'StripeInvalidRequestError' ? 502 : 500);
+    return res.status(status).json({ error: err?.message || 'Could not load billing history' });
+  }
+});
+
+/**
+ * POST /api/billing/portal
+ * Creates a Stripe Billing Portal session for the logged-in user.
+ */
+app.post('/api/billing/portal', optionalAuth, async (req, res) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
+
+    const userId = String(req.user._id ?? req.user.id);
+    const db = client.db(dbName);
+    const userIds = [userId];
+    if (ObjectId.isValid(userId)) {
+      userIds.push(new ObjectId(userId));
+    }
+    const userOrEmailFilter = {
+      $or: [
+        { userId: { $in: userIds } },
+        ...(req.user.email
+          ? [
+              { userEmail: req.user.email },
+              { customerEmail: req.user.email },
+              { 'metadata.email': req.user.email },
+            ]
+          : []),
+      ],
+    };
+
+    const latest = await db
+      .collection(paymentsCollectionName)
+      .findOne(userOrEmailFilter, { sort: { createdAt: -1 } });
+    let stripeCustomerId = latest?.stripeCustomerId ?? null;
+
+    if (!stripeCustomerId && req.user.email) {
+      try {
+        const customers = await getStripe().customers.list({
+          email: req.user.email,
+          limit: 1,
+        });
+        if (customers.data.length > 0) {
+          stripeCustomerId = customers.data[0].id;
+        }
+      } catch (cErr) {}
+    }
+
+    if (!stripeCustomerId) {
+      return res.status(400).json({
+        error: 'No Stripe customer is linked to this account yet. Please choose a plan first.',
+      });
+    }
+
+    const returnUrl = process.env.NEXT_PUBLIC_APP_URL || 'http://localhost:3000';
+    const session = await getStripe().billingPortal.sessions.create({
+      customer: stripeCustomerId,
+      return_url: `${returnUrl}/billing`,
+    });
+
+    return res.status(201).json({ data: { url: session.url } });
+  } catch (err) {
+    console.error('POST billing portal error:', err?.message ?? err);
+    const status =
+      err?.statusCode ??
+      (err?.type === 'StripeInvalidRequestError' ? 400 : 502);
+    return res.status(status).json({ error: err?.message || 'Could not create billing portal session' });
+  }
+});
+
+/**
+ * GET /api/stats
+ * Platform statistics for the hero section.
+ */
+app.get('/api/stats', async (_req, res) => {
+  try {
+    const db = client.db(dbName);
+    const [jobs, seekers, recruiters] = await Promise.all([
+      db.collection(jobsCollectionName).find({ isDeleted: { $ne: true } }, {
+        projection: { status: 1, isActive: 1, companyName: 1, createdAt: 1 },
+      }).toArray(),
+      db.collection('user').find({ role: 'seeker' }, {
+        projection: { _id: 1 },
+      }).toArray(),
+      db.collection('user').find({ role: 'recruiter' }, {
+        projection: { companyName: 1 },
+      }).toArray(),
+    ]);
+
+    const closedStatuses = new Set(['closed', 'expired', 'filled', 'archived']);
+    const activeJobs = jobs.filter((job) => {
+      const status = String(job.status ?? '').toLowerCase();
+      return job.isActive !== false && !closedStatuses.has(status);
+    }).length;
+    const now = new Date();
+    const monthStart = new Date(Date.UTC(now.getUTCFullYear(), now.getUTCMonth(), 1));
+    const newJobsThisMonth = jobs.filter((job) => {
+      const createdAt = job.createdAt ? new Date(job.createdAt) : null;
+      return createdAt && !Number.isNaN(createdAt.getTime()) && createdAt >= monthStart;
+    }).length;
+    const companyNames = new Set();
+    for (const value of [
+      ...jobs.map((job) => job.companyName),
+      ...recruiters.map((user) => user.companyName),
+    ]) {
+      if (typeof value === 'string' && value.trim()) {
+        companyNames.add(value.trim().toLocaleLowerCase());
+      }
+    }
+
+    return res.json({
+      data: {
+        activeJobs,
+        newJobsThisMonth,
+        companies: companyNames.size,
+        jobSeekers: seekers.length,
+        satisfactionRate: null,
+      },
+    });
+  } catch (err) {
+    console.error('GET platform stats error:', err?.message ?? err);
+    return res.status(500).json({ error: 'Could not load platform statistics' });
+  }
+});
+
+function normalizeTypeKey(type) {
+  return String(type ?? '')
+    .toLowerCase()
+    .replace(/[^a-z]/g, '');
+}
+
+function companySlug(value) {
+  return String(value ?? '')
+    .normalize('NFKD')
+    .replace(/[\u0300-\u036f]/g, '')
+    .toLowerCase()
+    .replace(/&/g, ' and ')
+    .replace(/[^\p{L}\p{N}]+/gu, '-')
+    .replace(/^-+|-+$/g, '');
+}
+
+function isJobOpen(job) {
+  return job.isActive !== false &&
+    !['closed', 'expired', 'filled', 'archived'].includes(String(job.status ?? '').toLowerCase());
+}
+
+function companyText(value) {
+  return typeof value === 'string' && value.trim() ? value.trim() : null;
+}
+
+function companyWebsite(value) {
+  const text = companyText(value);
+  if (!text) return null;
+  try {
+    const url = new URL(text);
+    return ['http:', 'https:'].includes(url.protocol) ? url.toString() : null;
+  } catch {
+    return null;
+  }
+}
+
+function companyData(jobs, recruiters) {
+  const companies = new Map();
+  const addCompany = (name, source = {}) => {
+    const companyName = typeof name === 'string' ? name.trim() : '';
+    const slug = companySlug(companyName);
+    if (!companyName || !slug) return null;
+    const key = slug;
+    const current = companies.get(key) ?? {
+      slug,
+      name: companyName,
+      logoUrl: null,
+      industry: null,
+      size: null,
+      website: null,
+      description: null,
+      locations: new Set(),
+      jobs: [],
+    };
+    current.logoUrl ??= companyText(source.logoUrl) ?? companyText(source.companyOverview?.imageUrl);
+    current.industry ??= companyText(source.companyOverview?.industry) ?? companyText(source.companyIndustry);
+    current.size ??= companyText(source.companyOverview?.size) ?? companyText(source.companySize);
+    current.website ??= companyWebsite(source.companyOverview?.website) ?? companyWebsite(source.website);
+    current.description ??= companyText(source.companyOverview?.description) ?? companyText(source.companyDescription);
+    companies.set(key, current);
+    return current;
+  };
+
+  for (const recruiter of recruiters) {
+    addCompany(recruiter.companyName, recruiter);
+  }
+  for (const job of jobs) {
+    const company = addCompany(job.companyName, job);
+    if (!company) continue;
+    const location = typeof job.location === 'string' ? job.location.trim() : '';
+    if (location) company.locations.add(location);
+    const id = String(job._id ?? job.id ?? '');
+    if (!id) continue;
+    const createdAt = job.createdAt ? new Date(job.createdAt) : null;
+    const salaryMin = job.salaryMin == null ? null : Number(job.salaryMin);
+    const salaryMax = job.salaryMax == null ? null : Number(job.salaryMax);
+    company.jobs.push({
+      id,
+      title: typeof job.title === 'string' && job.title.trim() ? job.title.trim() : 'Untitled job',
+      location: location || (job.remote === true ? 'Remote' : null),
+      type: typeof job.type === 'string' ? job.type : null,
+      remote: job.remote === true,
+      salaryMin: salaryMin !== null && Number.isFinite(salaryMin) ? salaryMin : null,
+      salaryMax: salaryMax !== null && Number.isFinite(salaryMax) ? salaryMax : null,
+      currency: typeof job.currency === 'string' ? job.currency : null,
+      salaryFrequency: typeof job.salaryFrequency === 'string' ? job.salaryFrequency : null,
+      status: isJobOpen(job) ? 'open' : 'closed',
+      createdAt: createdAt && !Number.isNaN(createdAt.getTime()) ? createdAt.toISOString() : null,
+    });
+  }
+
+  return [...companies.values()].map((company) => {
+    company.jobs.sort((a, b) => new Date(b.createdAt ?? 0).getTime() - new Date(a.createdAt ?? 0).getTime());
+    const { jobs: companyJobs, locations, ...details } = company;
+    return {
+      ...details,
+      locations: [...locations].sort((a, b) => a.localeCompare(b)),
+      jobs: companyJobs,
+      jobCount: companyJobs.length,
+      openJobCount: companyJobs.filter((job) => job.status === 'open').length,
+    };
+  });
+}
+
+app.get('/api/companies', async (_req, res) => {
+  try {
+    const db = client.db(dbName);
+    const [jobs, recruiters] = await Promise.all([
+      db.collection(jobsCollectionName)
+        .find({ isDeleted: { $ne: true } })
+        .toArray(),
+      db.collection('user')
+        .find(
+          { role: 'recruiter', companyName: { $type: 'string', $ne: '' } },
+          { projection: { companyName: 1, companyIndustry: 1, companySize: 1, website: 1, companyDescription: 1 } },
+        )
+        .toArray(),
+    ]);
+    const companies = companyData(jobs, recruiters)
+      .map(({ jobs: _jobs, ...company }) => company)
+      .sort((a, b) => a.name.localeCompare(b.name));
+    return res.json({ data: companies });
+  } catch (err) {
+    console.error('GET companies error:', err?.message ?? err);
+    return res.status(500).json({ error: 'Could not load companies' });
+  }
+});
+
+app.get('/api/companies/:slug', async (req, res) => {
+  try {
+    const slug = String(req.params.slug ?? '');
+    if (!slug) return res.status(400).json({ error: 'Invalid company' });
+    const db = client.db(dbName);
+    const [jobs, recruiters] = await Promise.all([
+      db.collection(jobsCollectionName)
+        .find({ isDeleted: { $ne: true } })
+        .toArray(),
+      db.collection('user')
+        .find(
+          { role: 'recruiter', companyName: { $type: 'string', $ne: '' } },
+          { projection: { companyName: 1, companyIndustry: 1, companySize: 1, website: 1, companyDescription: 1 } },
+        )
+        .toArray(),
+    ]);
+    const company = companyData(jobs, recruiters).find((item) => item.slug === slug);
+    if (!company) return res.status(404).json({ error: 'Company not found' });
+    const { jobs: companyJobs, locations, ...details } = company;
+    return res.json({
+      data: {
+        company: {
+          ...details,
+          locations: [...locations].sort((a, b) => a.localeCompare(b)),
+          jobCount: companyJobs.length,
+          openJobCount: companyJobs.filter((job) => job.status === 'open').length,
+        },
+        jobs: companyJobs,
+      },
+    });
+  } catch (err) {
+    console.error('GET company details error:', err?.message ?? err);
+    return res.status(500).json({ error: 'Could not load company details' });
+  }
+});
+
+function toJob(doc) {
+  if (!doc) return null;
+  const job = { ...doc };
+  job.id = String(job._id ?? job.id ?? '');
+  delete job._id;
+  delete job.recruiterId;
+  delete job.isSeed;
+  job.salaryMin = job.salaryMin == null ? null : Number(job.salaryMin);
+  job.salaryMax = job.salaryMax == null ? null : Number(job.salaryMax);
+  job.easyApply = job.easyApply === true;
+  job.hot = job.hot === true;
+  job.remote = job.remote === true;
+  job.verifiedEmployer = job.verifiedEmployer === true;
+  return job;
+}
+
+function toJobDetail(doc, isOwner, hasApplied, isSaved) {
+  if (!doc) return null;
+  const job = { ...doc };
+  job.id = String(job._id ?? job.id ?? '');
+  delete job._id;
+  delete job.recruiterId;
+  delete job.isSeed;
+
+  job.salaryMin = job.salaryMin == null ? null : Number(job.salaryMin);
+  job.salaryMax = job.salaryMax == null ? null : Number(job.salaryMax);
+  job.easyApply = job.easyApply === true;
+  job.hot = job.hot === true;
+  job.remote = job.remote === true;
+  job.verifiedEmployer = job.verifiedEmployer === true;
+  job.responsibilities = Array.isArray(job.responsibilities) ? job.responsibilities : [];
+  job.requirements = Array.isArray(job.requirements) ? job.requirements : [];
+  job.skills = Array.isArray(job.skills) ? job.skills : [];
+  job.benefits = Array.isArray(job.benefits) ? job.benefits : [];
+  job.companyOverview = job.companyOverview ?? null;
+  job.status = job.status ?? 'open';
+  job.createdAt = job.createdAt ? new Date(job.createdAt).toISOString() : null;
+
+  job.isOwner = isOwner;
+  job.hasApplied = hasApplied;
+  job.isSaved = isSaved;
+
+  return job;
+}
+
+/**
+ * GET /api/dashboard
+ * Query: q, type (csv), workMode, level, salaryMin, sort (newest|salary), page, limit
+ * Response: { data: Job[], meta: { page, limit, total, totalPages, facets } }
+ */
+const handleGetDashboard = async (req, res) => {
+  try {
+    const db = client.db(dbName);
+    const userId = req.user ? String(req.user._id ?? req.user.id) : String(req.query.userId ?? '');
+
+    let savedJobsCount = 12;
+    let applicationsCount = 24;
+    let interviewsCount = 3;
+    let offersCount = 1;
+
+    if (userId) {
+      const realSaved = await db.collection(savedJobsCollectionName).countDocuments({
+        $or: [
+          { userId },
+          ...(ObjectId.isValid(userId) ? [{ userId: new ObjectId(userId) }] : []),
+        ],
+      });
+      const realApplied = await db.collection(applicationsCollectionName).countDocuments({
+        $or: [
+          { userId },
+          ...(ObjectId.isValid(userId) ? [{ userId: new ObjectId(userId) }] : []),
+        ],
+      });
+      if (realSaved > 0) savedJobsCount = realSaved;
+      if (realApplied > 0) applicationsCount = realApplied;
+    }
+
+    const recentActivity = [
+      {
+        id: "act-1",
+        type: "status_update",
+        title: "Application for Senior Product Designer at TechFlow updated to 'Under Review'",
+        highlight: "'Under Review'",
+        timeAgo: "2 hours ago",
+      },
+      {
+        id: "act-2",
+        type: "job_alert",
+        title: "New Job Alert: Lead Frontend Engineer at FinGrid matches your profile.",
+        timeAgo: "5 hours ago",
+      },
+      {
+        id: "act-3",
+        type: "message",
+        title: "You have a new message from Sarah Jenkins (Hiring Manager at CloudOps).",
+        timeAgo: "1 day ago",
+      },
+      {
+        id: "act-4",
+        type: "status_update",
+        title: "Application for Senior Product Designer at TechFlow updated to 'Under Review'",
+        highlight: "'Under Review'",
+        timeAgo: "2 hours ago",
+      },
+      {
+        id: "act-5",
+        type: "job_alert",
+        title: "New Job Alert: Lead Frontend Engineer at FinGrid matches your profile.",
+        timeAgo: "5 hours ago",
+      },
+      {
+        id: "act-6",
+        type: "message",
+        title: "You have a new message from Sarah Jenkins (Hiring Manager at CloudOps).",
+        timeAgo: "1 day ago",
+      },
+    ];
+
+    res.json({
+      data: {
+        stats: {
+          savedJobs: savedJobsCount,
+          applications: applicationsCount,
+          interviews: interviewsCount,
+          offers: offersCount,
+        },
+        recentActivity,
+      },
+    });
+  } catch (err) {
+    console.error('GET dashboard error:', err?.message ?? err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+app.get('/api/dashboard', optionalAuth, handleGetDashboard);
+
+/**
+ * GET /api/jobs
+ * Query: q, status (open|closed), type (csv), workMode, level, salaryMin, sort (newest|salary), page, limit
+ * Response: { data: Job[], meta: { page, limit, total, totalPages, facets } }
+ */
+const handleGetJobs = async (req, res) => {
+  try {
+    const q = String(req.query.q ?? '').trim();
+    const status = String(req.query.status ?? '').trim().toLowerCase();
+    if (status && !['open', 'closed'].includes(status)) {
+      return res.status(400).json({ error: 'status must be open or closed' });
+    }
+    const types = String(req.query.type ?? '')
+      .split(',')
+      .map((t) => t.trim())
+      .filter(Boolean);
+    const workMode = String(req.query.workMode ?? '').trim();
+    const level = String(req.query.level ?? '').trim();
+    const salaryMin = String(req.query.salaryMin ?? '').trim();
+    const sort = String(req.query.sort ?? 'newest') === 'salary' ? 'salary' : 'newest';
+    const page = Math.max(1, parseInt(String(req.query.page ?? '1'), 10) || 1);
+    const limit = Math.min(50, Math.max(1, parseInt(String(req.query.limit ?? '10'), 10) || 10));
+
+    const db = client.db(dbName);
+    const jobs = await db.collection(jobsCollectionName)
+      .find({ isDeleted: { $ne: true } })
+      .toArray();
+
+    // Full-text-ish search across title / company / location.
+    const searched = q
+      ? jobs.filter((job) => {
+          const haystack = `${job.title ?? ''} ${job.companyName ?? ''} ${job.location ?? ''}`.toLowerCase();
+          return haystack.includes(q.toLowerCase());
+        })
+      : jobs;
+
+    // Facets: job-type counts for the current search (before type filtering).
+    const typeCounts = {};
+    for (const job of searched) {
+      const key = normalizeTypeKey(job.type);
+      typeCounts[key] = (typeCounts[key] ?? 0) + 1;
+    }
+
+    const filtered = searched.filter((job) => {
+      if (status === 'open') {
+        const jobStatus = String(job.status ?? '').toLowerCase();
+        if (
+          job.isActive === false ||
+          ['closed', 'expired', 'filled', 'archived'].includes(jobStatus)
+        ) {
+          return false;
+        }
+      } else if (status === 'closed') {
+        const jobStatus = String(job.status ?? '').toLowerCase();
+        if (
+          job.isActive !== false &&
+          !['closed', 'expired', 'filled', 'archived'].includes(jobStatus)
+        ) {
+          return false;
+        }
+      }
+      if (types.length > 0) {
+        const matchesType = types.some(
+          (t) => String(job.type ?? '').toLowerCase() === t.toLowerCase(),
+        );
+        if (!matchesType) return false;
+      }
+      if (workMode && String(job.workMode ?? '').toLowerCase() !== workMode.toLowerCase()) {
+        return false;
+      }
+      if (level && String(job.level ?? '').toLowerCase() !== level.toLowerCase()) {
+        return false;
+      }
+      if (salaryMin) {
+        const minSalary = Number(salaryMin);
+        if (Number(job.salaryMax ?? 0) < minSalary) return false;
+      }
+      return true;
+    });
+
+    const sorted = [...filtered].sort((a, b) => {
+      if (sort === 'salary') {
+        const aVal = Number(a.salaryMax ?? a.salaryMin ?? 0);
+        const bVal = Number(b.salaryMax ?? b.salaryMin ?? 0);
+        return bVal - aVal;
+      }
+      const aTime = new Date(a.createdAt ?? 0).getTime();
+      const bTime = new Date(b.createdAt ?? 0).getTime();
+      return bTime - aTime;
+    });
+
+    const total = sorted.length;
+    const totalPages = Math.ceil(total / limit);
+    const start = (page - 1) * limit;
+    const data = sorted.slice(start, start + limit).map(toJob);
+
+    res.json({
+      data,
+      meta: {
+        page,
+        limit,
+        total,
+        totalPages: totalPages > 0 ? totalPages : 0,
+        facets: { type: typeCounts },
+      },
+    });
+  } catch (err) {
+    console.error('GET jobs error:', err?.message ?? err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+app.get('/api/jobs', handleGetJobs);
+
+/**
+ * POST /api/jobs
+ * Creates a job listing for an authenticated recruiter.
+ */
+const handleCreateJob = async (req, res) => {
+  try {
+    if (!req.user) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
+
+    const role = String(req.user.role ?? '').toLowerCase();
+    if (role !== 'recruiter' && role !== 'admin') {
+      return res.status(403).json({ error: 'Only recruiters can publish jobs' });
+    }
+
+    const input = req.body?.job && typeof req.body.job === 'object'
+      ? req.body.job
+      : req.body;
+    const title = String(input.title ?? input.jobTitle ?? '').trim();
+    const companyName = String(input.companyName ?? input.company ?? '').trim();
+    const description = String(input.description ?? '').trim();
+    const location = String(input.location ?? '').trim();
+    const missingFields = [];
+    if (!title) missingFields.push('title');
+    if (!companyName) missingFields.push('companyName');
+    if (!description) missingFields.push('description');
+    if (!location) missingFields.push('location');
+    if (missingFields.length) {
+      return res.status(400).json({
+        error: 'Required job fields are missing',
+        fields: missingFields,
+      });
+    }
+
+    const parseList = (value, field) => {
+      if (value == null || value === '') return [];
+      const items = Array.isArray(value) ? value : String(value).split(/\r?\n/);
+      if (!items.every((item) => typeof item === 'string')) {
+        throw new Error(`${field} must be a list of strings`);
+      }
+      return items.map((item) => item.trim()).filter(Boolean);
+    };
+
+    const parseSalary = (value, field) => {
+      if (value == null || value === '') return null;
+      const salary = Number(value);
+      if (!Number.isFinite(salary) || salary < 0) {
+        throw new Error(`${field} must be a non-negative number`);
+      }
+      return salary;
+    };
+
+    let salaryMin;
+    let salaryMax;
+    let responsibilities;
+    let requirements;
+    let skills;
+    let benefits;
+    let applicationDeadline = null;
+    try {
+      salaryMin = parseSalary(input.salaryMin, 'salaryMin');
+      salaryMax = parseSalary(input.salaryMax, 'salaryMax');
+      responsibilities = parseList(input.responsibilities, 'responsibilities');
+      requirements = parseList(input.requirements ?? input.qualifications, 'requirements');
+      skills = parseList(input.skills, 'skills');
+      benefits = parseList(input.benefits, 'benefits');
+      if (input.applicationDeadline) {
+        applicationDeadline = new Date(input.applicationDeadline);
+        if (Number.isNaN(applicationDeadline.getTime())) {
+          throw new Error('applicationDeadline must be a valid date');
+        }
+      }
+    } catch (err) {
+      return res.status(400).json({ error: err.message });
+    }
+
+    if (salaryMin != null && salaryMax != null && salaryMax < salaryMin) {
+      return res.status(400).json({ error: 'salaryMax must be greater than or equal to salaryMin' });
+    }
+
+    const userId = String(req.user._id ?? req.user.id ?? '');
+    if (!userId) {
+      return res.status(401).json({ error: 'Authenticated user id is missing' });
+    }
+
+    const job = {
+      title,
+      companyName,
+      description,
+      location,
+      responsibilities,
+      requirements,
+      skills,
+      benefits,
+      type: String(input.type ?? input.jobType ?? 'Full-time').trim(),
+      workMode: String(input.workMode ?? (input.remote ? 'Remote' : '')).trim(),
+      level: String(input.level ?? input.experienceLevel ?? '').trim(),
+      salaryMin,
+      salaryMax,
+      currency: String(input.currency ?? 'USD').trim(),
+      salaryFrequency: String(input.salaryFrequency ?? input.frequency ?? '').trim(),
+      applicationDeadline,
+      companyOverview: input.companyOverview == null ? null : String(input.companyOverview).trim(),
+      logoUrl: input.logoUrl == null ? null : String(input.logoUrl).trim(),
+      remote: input.remote === true || String(input.workMode ?? '').toLowerCase() === 'remote',
+      easyApply: input.easyApply === true,
+      hot: false,
+      verifiedEmployer: false,
+      status: 'open',
+      recruiterId: userId,
+      applicantsCount: 0,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+      isSeed: false,
+    };
+
+    const result = await client.db(dbName).collection(jobsCollectionName).insertOne(job);
+    res.status(201).json({
+      success: true,
+      message: 'Job published successfully',
+      data: toJob({ ...job, _id: result.insertedId }),
+    });
+  } catch (err) {
+    console.error('POST create job error:', err?.message ?? err);
+    res.status(500).json({ error: 'Could not publish job' });
+  }
+};
+
+app.post('/api/jobs', requireSessionAuth, handleCreateJob);
+app.post('/jobs', requireSessionAuth, handleCreateJob);
+
+/**
+ * GET /api/jobs/:id
+ */
+const handleGetJobById = async (req, res) => {
+  try {
+    const { id } = req.params;
+    if (!id || id.length !== 24 || !ObjectId.isValid(id)) {
+      return res.status(400).json({ error: 'Invalid job id' });
+    }
+
+    const db = client.db(dbName);
+    const doc = await db.collection(jobsCollectionName).findOne({
+      _id: new ObjectId(id),
+      isDeleted: { $ne: true },
+    });
+    if (!doc) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    const userIdStr = req.user ? String(req.user._id ?? req.user.id) : null;
+    let hasApplied = false;
+    let isSaved = false;
+
+    if (userIdStr) {
+      const appDoc = await db.collection(applicationsCollectionName).findOne({
+        jobId: id,
+        $or: [
+          { userId: userIdStr },
+          ...(ObjectId.isValid(userIdStr) ? [{ userId: new ObjectId(userIdStr) }] : []),
+        ],
+      });
+      hasApplied = !!appDoc;
+
+      const saveDoc = await db.collection(savedJobsCollectionName).findOne({
+        jobId: id,
+        $or: [
+          { userId: userIdStr },
+          ...(ObjectId.isValid(userIdStr) ? [{ userId: new ObjectId(userIdStr) }] : []),
+        ],
+      });
+      isSaved = !!saveDoc;
+    }
+
+    const isOwner = !!(
+      req.user &&
+      doc.recruiterId &&
+      String(doc.recruiterId) === userIdStr
+    );
+
+    const job = toJobDetail(doc, isOwner, hasApplied, isSaved);
+    res.json({ data: job });
+  } catch (err) {
+    console.error('GET job details error:', err?.message ?? err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+app.get('/api/jobs/:id', optionalAuth, handleGetJobById);
+
+/**
+ * POST /api/jobs/:id/apply
+ */
+const handleApplyToJob = async (req, res) => {
+  try {
+    const jobId = String(req.params.id ?? '');
+    if (!ObjectId.isValid(jobId) || jobId.length !== 24) {
+      return res.status(400).json({ error: 'Invalid job id' });
+    }
+
+    if (!req.user) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
+
+    const role = req.user.role ?? 'seeker';
+    if (role === 'recruiter' || role === 'admin') {
+      return res.status(403).json({ error: 'Only job seekers can apply' });
+    }
+
+    const db = client.db(dbName);
+    const job = await db.collection(jobsCollectionName).findOne({
+      _id: new ObjectId(jobId),
+      isDeleted: { $ne: true },
+    });
+    if (!job) {
+      return res.status(404).json({ error: 'Job not found' });
+    }
+
+    if (job.status && job.status !== 'open') {
+      return res.status(400).json({ error: 'Job closed' });
+    }
+
+    const userIdStr = String(req.user._id ?? req.user.id);
+    const existing = await db.collection(applicationsCollectionName).findOne({
+      jobId,
+      $or: [
+        { userId: userIdStr },
+        ...(ObjectId.isValid(userIdStr) ? [{ userId: new ObjectId(userIdStr) }] : []),
+        { seekerId: userIdStr },
+        ...(ObjectId.isValid(userIdStr) ? [{ seekerId: new ObjectId(userIdStr) }] : []),
+      ],
+    });
+
+    if (existing) {
+      return res.status(409).json({ error: 'Already applied for this job', hasApplied: true });
+    }
+
+    // Free plan application limit
+    const userIdStrForPlan = String(req.user._id ?? req.user.id);
+    const planFilter = {
+      $or: [
+        { userId: userIdStrForPlan },
+        ...(ObjectId.isValid(userIdStrForPlan) ? [{ userId: new ObjectId(userIdStrForPlan) }] : []),
+        ...(req.user.email
+          ? [
+              { userEmail: req.user.email },
+              { customerEmail: req.user.email },
+              { 'metadata.email': req.user.email },
+            ]
+          : []),
+      ],
+      status: { $in: ['success', 'paid'] },
+    };
+    const latestPaymentForLimit = await db
+      .collection(paymentsCollectionName)
+      .findOne(planFilter, { sort: { createdAt: -1 } });
+    const paidPlan =
+      latestPaymentForLimit && latestPaymentForLimit.plan && latestPaymentForLimit.plan !== 'starter'
+        ? String(latestPaymentForLimit.plan).toLowerCase()
+        : 'starter';
+
+    if (paidPlan === 'starter') {
+      const applicationCount = await db
+        .collection(applicationsCollectionName)
+        .countDocuments({
+          $or: [
+            { userId: userIdStrForPlan },
+            ...(ObjectId.isValid(userIdStrForPlan) ? [{ userId: new ObjectId(userIdStrForPlan) }] : []),
+            { seekerId: userIdStrForPlan },
+            ...(ObjectId.isValid(userIdStrForPlan) ? [{ seekerId: new ObjectId(userIdStrForPlan) }] : []),
+          ],
+        });
+      if (applicationCount >= FREE_PLAN_APPLICATION_LIMIT) {
+        return res.status(402).json({
+          error: `Free plan allows ${FREE_PLAN_APPLICATION_LIMIT} applications. Upgrade to a paid plan to apply for more jobs.`,
+          limitReached: true,
+          limit: FREE_PLAN_APPLICATION_LIMIT,
+          currentPlan: paidPlan,
+        });
+      }
+    }
+
+    await db.collection(applicationsCollectionName).insertOne({
+      jobId,
+      userId: userIdStr,
+      seekerId: userIdStr,
+      recruiterId: job.recruiterId ?? null,
+      jobTitle: job.title ?? null,
+      companyName: job.companyName ?? null,
+      logoUrl: job.logoUrl ?? null,
+      status: 'applied',
+      coverNote: null,
+      resumeUrl: null,
+      appliedAt: new Date(),
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    });
+
+    await db.collection(jobsCollectionName).updateOne(
+      { _id: new ObjectId(jobId) },
+      { $inc: { applicantsCount: 1 } },
+    );
+
+    res.status(200).json({ success: true, message: 'Application submitted', hasApplied: true });
+  } catch (err) {
+    console.error('POST apply error:', err?.message ?? err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+app.post('/api/jobs/:id/apply', optionalAuth, handleApplyToJob);
+
+const applicationStatuses = new Set([
+  'applied',
+  'new',
+  'reviewing',
+  'under_review',
+  'shortlisted',
+  'interview',
+  'scheduled',
+  'rejected',
+  'hired',
+  'withdrawn',
+]);
+
+app.patch('/api/applications/:id/status', requireSessionAuth, async (req, res) => {
+  try {
+    if (!ObjectId.isValid(req.params.id)) {
+      return res.status(400).json({ error: 'Invalid application id' });
+    }
+
+    const status = String(req.body?.status ?? '').trim().toLowerCase().replace(/[\s-]+/g, '_');
+    if (!applicationStatuses.has(status)) {
+      return res.status(400).json({
+        error: 'Invalid application status',
+        allowedStatuses: [...applicationStatuses],
+      });
+    }
+
+    const user = req.user;
+    const role = String(user.role ?? '').toLowerCase();
+    if (role !== 'recruiter' && role !== 'admin') {
+      return res.status(403).json({ error: 'Only recruiters can update application status' });
+    }
+
+    const db = client.db(dbName);
+    const applications = db.collection(applicationsCollectionName);
+    const application = await applications.findOne({ _id: new ObjectId(req.params.id) });
+    if (!application) {
+      return res.status(404).json({ error: 'Application not found' });
+    }
+
+    if (role !== 'admin') {
+      const userId = String(user._id ?? user.id);
+      let recruiterId = application.recruiterId == null ? '' : String(application.recruiterId);
+
+      if (!recruiterId && application.jobId) {
+        const jobId = String(application.jobId);
+        const jobQuery = ObjectId.isValid(jobId)
+          ? { _id: new ObjectId(jobId) }
+          : { id: jobId };
+        const job = await db.collection(jobsCollectionName).findOne(jobQuery, {
+          projection: { recruiterId: 1 },
+        });
+        recruiterId = job?.recruiterId == null ? '' : String(job.recruiterId);
+      }
+
+      if (!recruiterId || recruiterId !== userId) {
+        return res.status(403).json({ error: 'You cannot update this application' });
+      }
+    }
+
+    const updatedAt = new Date();
+    await applications.updateOne(
+      { _id: application._id },
+      { $set: { status, updatedAt } },
+    );
+
+    return res.json({
+      success: true,
+      data: {
+        id: String(application._id),
+        status,
+        updatedAt: updatedAt.toISOString(),
+      },
+    });
+  } catch (err) {
+    console.error('PATCH application status error:', err?.message ?? err);
+    return res.status(500).json({ error: 'Could not update application status' });
+  }
+});
+
+/**
+ * GET /api/saved-jobs
+ */
+const handleGetSavedJobs = async (req, res) => {
+  try {
+    const userId = req.user ? String(req.user._id ?? req.user.id) : String(req.query.userId ?? req.body?.userId ?? '');
+    if (!userId) return res.json([]);
+
+    const docs = await client
+      .db(dbName)
+      .collection(savedJobsCollectionName)
+      .find({
+        $or: [
+          { userId },
+          ...(ObjectId.isValid(userId) ? [{ userId: new ObjectId(userId) }] : []),
+        ],
+      })
+      .toArray();
+
+    const ids = docs
+      .map((doc) => String(doc.jobId ?? ''))
+      .filter(Boolean);
+    res.json(ids);
+  } catch (err) {
+    console.error('GET saved-jobs error:', err?.message ?? err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+app.get('/api/saved-jobs', optionalAuth, handleGetSavedJobs);
+
+/**
+ * POST /api/jobs/:id/save
+ */
+const handleSaveJob = async (req, res) => {
+  try {
+    const userId = req.user ? String(req.user._id ?? req.user.id) : String(req.query.userId ?? req.body?.userId ?? '');
+    const jobId = String(req.params.id ?? '');
+    if (!userId || !jobId) {
+      return res.status(400).json({ error: 'userId and jobId are required' });
+    }
+    const db = client.db(dbName);
+    await db
+      .collection(savedJobsCollectionName)
+      .updateOne(
+        { userId, jobId },
+        { $set: { userId, jobId, savedAt: new Date() } },
+        { upsert: true },
+      );
+    res.json({ saved: true });
+  } catch (err) {
+    console.error('POST save error:', err?.message ?? err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+app.post('/api/jobs/:id/save', optionalAuth, handleSaveJob);
+
+/**
+ * DELETE /api/jobs/:id/save
+ */
+const handleDeleteSavedJob = async (req, res) => {
+  try {
+    const userId = req.user ? String(req.user._id ?? req.user.id) : String(req.query.userId ?? req.body?.userId ?? '');
+    const jobId = String(req.params.id ?? '');
+    if (!userId || !jobId) {
+      return res.status(400).json({ error: 'userId and jobId are required' });
+    }
+    const db = client.db(dbName);
+    await db
+      .collection(savedJobsCollectionName)
+      .deleteOne({ userId, jobId });
+    res.json({ saved: false });
+  } catch (err) {
+    console.error('DELETE save error:', err?.message ?? err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+app.delete('/api/jobs/:id/save', optionalAuth, handleDeleteSavedJob);
+
+async function run() {
+  try {
+    await client.connect();
+    await client.db('admin').command({ ping: 1 });
+    console.log('MongoDB connection successful');
+  } catch (err) {
+    console.error('MongoDB connection failed:', err.message);
+  }
+}
+
+app.listen(PORT, () => {
+  console.log(`Server listening on port ${PORT}`);
+});
+
+run();
