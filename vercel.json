@@ -7,7 +7,6 @@
   "outputDirectory": ".",
   "functions": {
     "index.js": {
-      "runtime": "nodejs",
       "maxDuration": 60
     }
   },
