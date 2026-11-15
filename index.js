@@ -5,6 +5,8 @@ const { MongoClient, ObjectId } = require('mongodb');
 const express = require('express');
 const cors = require('cors');
 const { rateLimit } = require('express-rate-limit');
+const helmet = require('helmet');
+const { z } = require('zod');
 const { getBetterAuthSessionToken } = require('./lib/better-auth-session');
 const {
   createCheckoutSession,
@@ -19,6 +21,7 @@ const {
   FREE_PLAN_APPLICATION_LIMIT,
   getPlan,
   getPlanList,
+  getCheckoutPricing,
 } = require('./lib/plans');
 
 const { version } = require('./package.json');
@@ -30,6 +33,7 @@ const dbName = process.env.DB_NAME || 'hireloopdb';
 const jobsCollectionName = process.env.JOBS_COLLECTION || 'jobs';
 const savedJobsCollectionName = process.env.SAVED_JOBS_COLLECTION || 'savedJobs';
 const applicationsCollectionName = process.env.APPLICATIONS_COLLECTION || 'applications';
+const activitiesCollectionName = process.env.ACTIVITIES_COLLECTION || 'activities';
 const paymentsCollectionName = process.env.PAYMENTS_COLLECTION || 'payments';
 
 const defaultAllowedOrigins = [
@@ -50,8 +54,7 @@ const corsOptions = {
       callback(null, true);
       return;
     }
-
-    callback(new Error('Not allowed by CORS'));
+    callback(null, false);
   },
   credentials: true,
   methods: ['GET', 'POST', 'PUT', 'PATCH', 'DELETE', 'OPTIONS'],
@@ -61,101 +64,328 @@ const corsOptions = {
 app.use(cors(corsOptions));
 app.options('/{*splat}', cors(corsOptions));
 
-/**
- * Handles Stripe invoice events (invoice.paid / invoice.payment_failed) by
- * keeping the payments ledger in sync with the billing state.
- */
-async function recordInvoiceEvent(invoice, eventType) {
-  const now = new Date();
-  const status =
-    eventType === 'invoice.paid'
-      ? 'success'
-      : eventType === 'invoice.payment_failed'
-        ? 'failed'
-        : 'pending';
-  const customerId = invoice.customer?.id ?? null;
-  let userId = null;
+app.use(helmet({
+  crossOriginResourcePolicy: { policy: 'cross-origin' },
+  contentSecurityPolicy: false,
+}));
 
-  if (customerId) {
-    try {
-      const customer = await getStripe().customers.retrieve(customerId, {
-        expand: ['metadata'],
-      });
-      userId = customer.metadata?.userId ?? null;
-    } catch (err) {
-      console.error('invoice customer retrieve error:', err?.message ?? err);
+app.use(express.json({ limit: '100kb' }));
+
+const sanitize = (obj) => {
+  if (obj && typeof obj === 'object') {
+    for (const key of Object.keys(obj)) {
+      if (key.startsWith('$') || key.includes('.')) {
+        delete obj[key];
+      } else {
+        sanitize(obj[key]);
+      }
     }
   }
+  return obj;
+};
 
-  const doc = {
-    provider: 'stripe',
-    transactionId: invoice.id,
-    paymentIntentId: invoice.payment_intent ? String(invoice.payment_intent) : null,
-    userId,
-    userName: null,
-    userEmail: invoice.customer_email || null,
-    stripeCustomerId: customerId,
-    subscriptionId: invoice.subscription || null,
-    plan: invoice.metadata?.plan || null,
-    planName: invoice.metadata?.planName || null,
-    billing: invoice.metadata?.billing || null,
-    interval:
-      invoice.metadata?.billing === 'yearly'
-        ? 'year'
-        : invoice.metadata?.billing === 'monthly'
-          ? 'month'
-          : null,
-    amount: invoice.amount_paid ?? invoice.amount_due ?? 0,
-    currency: String(invoice.currency ?? 'USD').toUpperCase(),
-    status,
-    receiptUrl: invoice.hosted_invoice_url || invoice.invoice_url || null,
-    stripeStatus: invoice.status,
-    updatedAt: now,
+app.use((req, res, next) => {
+  sanitize(req.body);
+  sanitize(req.params);
+  sanitize(req.query);
+  next();
+});
+
+const globalLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 200,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: { error: 'Too many requests. Please try again shortly.' },
+});
+app.use(globalLimiter);
+
+const authLimiter = rateLimit({
+  windowMs: 15 * 60 * 1000,
+  limit: 20,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: { error: 'Too many authentication attempts. Please try again later.' },
+});
+
+const checkoutLimiter = rateLimit({
+  windowMs: 60 * 1000,
+  limit: 20,
+  standardHeaders: 'draft-8',
+  legacyHeaders: false,
+  message: { error: 'Too many checkout attempts. Please try again shortly.' },
+});
+
+async function resolveSessionUserFromReq(req, db) {
+  const token = getBetterAuthSessionToken(
+    req.headers.cookie,
+    req.headers.authorization,
+    process.env.BETTER_AUTH_SECRET,
+  );
+  if (!token) return null;
+
+  const session = await db.collection('session').findOne({
+    token,
+    expiresAt: { $gt: new Date() },
+  });
+  if (!session?.userId) return null;
+
+  return db.collection('user').findOne({
+    $or: [
+      { _id: session.userId },
+      ...(ObjectId.isValid(String(session.userId))
+        ? [{ _id: new ObjectId(String(session.userId)) }]
+        : []),
+      { id: String(session.userId) },
+    ],
+  });
+}
+
+async function requireSessionAuth(req, res, next) {
+  try {
+    req.user = await resolveSessionUserFromReq(req, client.db(dbName));
+    if (!req.user) {
+      return res.status(401).json({ error: 'Authentication required' });
+    }
+    return next();
+  } catch (err) {
+    console.error('Session authentication failed:', err?.message ?? err);
+    return res.status(500).json({ error: 'Could not verify session' });
+  }
+}
+
+async function optionalSessionAuth(req, res, next) {
+  try {
+    req.user = await resolveSessionUserFromReq(req, client.db(dbName));
+  } catch (err) {
+    console.error('optionalSessionAuth error:', err);
+    req.user = null;
+  }
+  next();
+}
+
+function requireRole(...allowedRoles) {
+  return (req, res, next) => {
+    const role = String(req.user?.role ?? '').toLowerCase();
+    if (!allowedRoles.includes(role)) {
+      return res.status(403).json({ error: 'Insufficient permissions' });
+    }
+    next();
   };
+}
+
+function validate(schema) {
+  return (req, res, next) => {
+    const result = schema.safeParse({
+      body: req.body,
+      query: req.query,
+      params: req.params,
+    });
+    if (!result.success) {
+      const issues = result.error.issues.map(i => `${i.path.join('.')}: ${i.message}`).join('; ');
+      return res.status(400).json({ error: 'Validation failed', details: issues });
+    }
+    // Mutate in place — Express 5 makes req.query a read-only getter
+    if (result.data.body) Object.assign(req.body, result.data.body);
+    if (result.data.query) Object.assign(req.query, result.data.query);
+    if (result.data.params) Object.assign(req.params, result.data.params);
+    next();
+  };
+}
+
+const paginationQuerySchema = z.object({
+  page: z.coerce.number().int().min(1).default(1),
+  limit: z.coerce.number().int().min(1).max(50).default(10),
+  sort: z.enum(['newest', 'salary']).default('newest'),
+});
+
+const jobFiltersQuerySchema = paginationQuerySchema.extend({
+  q: z.string().trim().max(200).optional(),
+  status: z.enum(['open', 'closed']).optional(),
+  type: z.string().optional(),
+  workMode: z.string().optional(),
+  level: z.string().optional(),
+  salaryMin: z.string().optional(),
+});
+
+const objectIdParamSchema = z.object({
+  params: z.object({
+    id: z.string().length(24).regex(/^[0-9a-fA-F]{24}$/),
+  }),
+});
+
+const saveJobBodySchema = z.object({
+  body: z.object({}).strict(),
+});
+
+const applyJobBodySchema = z.object({
+  body: z.object({}).strict(),
+});
+
+const applicationStatusBodySchema = z.object({
+  body: z.object({
+    status: z.enum([
+      'applied', 'new', 'reviewing', 'under_review', 'shortlisted',
+      'interview', 'scheduled', 'rejected', 'hired', 'withdrawn'
+    ]),
+  }),
+});
+
+const activityTrackBodySchema = z.object({
+  body: z.object({
+    event: z.string().min(1).max(100),
+    jobId: z.string().length(24).regex(/^[0-9a-fA-F]{24}$/).optional(),
+    metadata: z.record(z.unknown()).optional(),
+  }),
+});
+
+const checkoutConfigQuerySchema = z.object({
+  query: z.object({
+    plan: z.string().optional(),
+    billing: z.enum(['monthly', 'yearly']).optional(),
+  }),
+});
+
+const paymentIntentBodySchema = z.object({
+  body: z.object({
+    planId: z.string().min(1).optional(),
+    billing: z.enum(['monthly', 'yearly']).optional(),
+    currency: z.string().length(3).optional(),
+    email: z.string().email().optional(),
+  }),
+});
+
+const checkoutConfirmBodySchema = z.object({
+  body: z.object({
+    paymentIntentId: z.string().startsWith('pi_'),
+  }),
+});
+
+const checkoutSessionBodySchema = z.object({
+  body: z.object({
+    planId: z.string().min(1).optional(),
+    billing: z.enum(['monthly', 'yearly']).optional(),
+    email: z.string().email().optional(),
+  }),
+});
+
+const checkoutSessionParamSchema = z.object({
+  params: z.object({
+    sessionId: z.string().startsWith('cs_'),
+  }),
+});
+
+const paymentParamSchema = z.object({
+  params: z.object({
+    paymentIntentId: z.string().regex(/^(pi_|cs_)/),
+  }),
+});
+
+const createJobBodySchema = z.object({
+  body: z.object({
+    title: z.string().trim().min(1).max(200),
+    companyName: z.string().trim().min(1).max(200),
+    description: z.string().trim().min(1).max(50000),
+    location: z.string().trim().min(1).max(200),
+    type: z.string().trim().max(50).optional(),
+    workMode: z.string().trim().max(50).optional(),
+    level: z.string().trim().max(50).optional(),
+    salaryMin: z.number().int().min(0).optional(),
+    salaryMax: z.number().int().min(0).optional(),
+    currency: z.string().length(3).optional(),
+    salaryFrequency: z.string().trim().max(20).optional(),
+    responsibilities: z.array(z.string().trim().max(500)).max(50).optional(),
+    requirements: z.array(z.string().trim().max(500)).max(50).optional(),
+    skills: z.array(z.string().trim().max(100)).max(30).optional(),
+    benefits: z.array(z.string().trim().max(500)).max(30).optional(),
+    applicationDeadline: z.string().datetime().optional(),
+    companyOverview: z.string().trim().max(5000).optional(),
+    logoUrl: z.string().url().optional(),
+    remote: z.boolean().optional(),
+    easyApply: z.boolean().optional(),
+  }).strict(),
+});
+
+const companySlugParamSchema = z.object({
+  params: z.object({
+    slug: z.string().min(1).max(200),
+  }),
+});
+
+const billingPortalBodySchema = z.object({
+  body: z.object({}).strict(),
+});
+
+function paymentStatusFromIntent(intent) {
+  if (intent.status === 'succeeded') return 'success';
+  if (intent.status === 'canceled' || intent.last_payment_error) return 'failed';
+  return 'pending';
+}
+
+async function recordPaymentIntent(intent, user = null) {
+  const now = new Date();
+  const status = paymentStatusFromIntent(intent);
+  const userId = user
+    ? String(user._id ?? user.id)
+    : intent.metadata?.userId || null;
+  const userEmail =
+    intent.receipt_email || intent.metadata?.email || user?.email || null;
 
   await client
     .db(dbName)
     .collection(paymentsCollectionName)
     .updateOne(
-      { transactionId: invoice.id },
-      { $set: doc, $setOnInsert: { createdAt: now } },
+      { transactionId: intent.id },
+      {
+        $set: {
+          provider: 'stripe',
+          transactionId: intent.id,
+          paymentIntentId: intent.id,
+          userId,
+          userName: user?.name ?? null,
+          userEmail,
+          plan: intent.metadata?.plan || null,
+          planName:
+            intent.metadata?.planName || intent.description || null,
+          billing: intent.metadata?.billing || null,
+          amount: intent.amount,
+          currency: String(intent.currency ?? '').toUpperCase(),
+          status,
+          stripeStatus: intent.status,
+          updatedAt: now,
+        },
+        $setOnInsert: { createdAt: now },
+      },
       { upsert: true },
     );
+
+  return {
+    status,
+    stripeStatus: intent.status,
+    amount: intent.amount,
+    currency: String(intent.currency ?? '').toUpperCase(),
+  };
 }
 
-/**
- * Handles Stripe subscription lifecycle events (customer.subscription.updated /
- * customer.subscription.deleted) so the plan status stays in sync.
- */
-async function applySubscriptionState(subscription) {
-  const customerId = subscription.customer?.id ?? null;
-  const userId = subscription.metadata?.userId ?? null;
-  const db = client.db(dbName);
-  const filter = userId ? { userId } : customerId ? { stripeCustomerId: customerId } : {};
-  const latest = await db
-    .collection(paymentsCollectionName)
-    .findOne(filter, { sort: { createdAt: -1 } });
+app.get('/', (req, res) => {
+  res.status(200).json({
+    name: 'hireloop API',
+    status: 'running',
+    version,
+    message: 'hireloop API is running',
+    time: new Date().toISOString(),
+  });
+});
 
-  if (!latest) return;
+app.get('/health', async (req, res) => {
+  try {
+    await client.db('admin').command({ ping: 1 });
+    res.status(200).json({ status: 'ok' });
+  } catch (err) {
+    res.status(503).json({ status: 'error' });
+  }
+});
 
-  await db.collection(paymentsCollectionName).updateOne(
-    { transactionId: latest.transactionId },
-    {
-      $set: {
-        subscriptionId: subscription.id,
-        status: subscription.status === 'canceled' ? 'canceled' : 'success',
-        cancelAtPeriodEnd: Boolean(subscription.cancel_at_period_end),
-        updatedAt: new Date(),
-      },
-    },
-  );
-}
-
-/**
- * POST /api/checkout/webhook
- * Stripe webhook endpoint. Registered before the JSON body parser so the raw
- * payload is available for signature verification.
- */
 app.post(
   '/api/checkout/webhook',
   express.raw({ type: 'application/json' }),
@@ -214,157 +444,6 @@ app.post(
   },
 );
 
-app.use(express.json());
-
-const checkoutLimiter = rateLimit({
-  windowMs: 60 * 1000,
-  limit: 20,
-  standardHeaders: 'draft-8',
-  legacyHeaders: false,
-  message: { error: 'Too many checkout attempts. Please try again shortly.' },
-});
-
-async function resolveSessionUserFromReq(req, db) {
-  const token = getBetterAuthSessionToken(
-    req.headers.cookie,
-    req.headers.authorization,
-    process.env.BETTER_AUTH_SECRET,
-  );
-  if (!token) return null;
-
-  const session = await db.collection('session').findOne({
-    token,
-    expiresAt: { $gt: new Date() },
-  });
-  if (!session?.userId) return null;
-
-  return db.collection('user').findOne({
-    $or: [
-      { _id: session.userId },
-      ...(ObjectId.isValid(String(session.userId))
-        ? [{ _id: new ObjectId(String(session.userId)) }]
-        : []),
-      { id: String(session.userId) },
-    ],
-  });
-}
-
-async function resolveUserFromReq(req, db) {
-  const sessionUser = await resolveSessionUserFromReq(req, db);
-  if (sessionUser) return sessionUser;
-
-  // Legacy userId-based lookup remains for existing non-job API consumers.
-  const rawUserId = req.query.userId || req.body?.userId;
-  if (!rawUserId) return null;
-  return db.collection('user').findOne({
-    $or: [
-      { _id: rawUserId },
-      ...(ObjectId.isValid(String(rawUserId))
-        ? [{ _id: new ObjectId(String(rawUserId)) }]
-        : []),
-      { id: String(rawUserId) },
-    ],
-  });
-}
-
-async function optionalAuth(req, res, next) {
-  try {
-    const db = client.db(dbName);
-    req.user = await resolveUserFromReq(req, db);
-  } catch (err) {
-    console.error('optionalAuth error:', err);
-    req.user = null;
-  }
-  next();
-}
-
-async function requireSessionAuth(req, res, next) {
-  try {
-    req.user = await resolveSessionUserFromReq(req, client.db(dbName));
-    if (!req.user) {
-      return res.status(401).json({ error: 'Authentication required' });
-    }
-    return next();
-  } catch (err) {
-    console.error('Session authentication failed:', err?.message ?? err);
-    return res.status(500).json({ error: 'Could not verify session' });
-  }
-}
-
-app.get('/', (req, res) => {
-  res.status(200).json({
-    name: 'hireloop API',
-    status: 'running',
-    version,
-    message: 'hireloop API is running',
-    time: new Date().toISOString(),
-  });
-});
-
-app.get('/health', async (req, res) => {
-  try {
-    await client.db('admin').command({ ping: 1 });
-    res.status(200).json({ status: 'ok' });
-  } catch (err) {
-    res.status(503).json({ status: 'error' });
-  }
-});
-
-function paymentStatusFromIntent(intent) {
-  if (intent.status === 'succeeded') return 'success';
-  if (intent.status === 'canceled' || intent.last_payment_error) return 'failed';
-  return 'pending';
-}
-
-async function recordPaymentIntent(intent, user = null) {
-  const now = new Date();
-  const status = paymentStatusFromIntent(intent);
-  const userId = user
-    ? String(user._id ?? user.id)
-    : intent.metadata?.userId || null;
-  const userEmail =
-    intent.receipt_email || intent.metadata?.email || user?.email || null;
-
-  await client
-    .db(dbName)
-    .collection(paymentsCollectionName)
-    .updateOne(
-      { transactionId: intent.id },
-      {
-        $set: {
-          provider: 'stripe',
-          transactionId: intent.id,
-          paymentIntentId: intent.id,
-          userId,
-          userName: user?.name ?? null,
-          userEmail,
-          plan: intent.metadata?.plan || null,
-          planName:
-            intent.metadata?.planName || intent.description || null,
-          billing: intent.metadata?.billing || null,
-          amount: intent.amount,
-          currency: String(intent.currency ?? '').toUpperCase(),
-          status,
-          stripeStatus: intent.status,
-          updatedAt: now,
-        },
-        $setOnInsert: { createdAt: now },
-      },
-      { upsert: true },
-    );
-
-  return {
-    status,
-    stripeStatus: intent.status,
-    amount: intent.amount,
-    currency: String(intent.currency ?? '').toUpperCase(),
-  };
-}
-
-/**
- * GET /api/plans
- * Pricing plans for the public pricing section.
- */
 app.get('/api/plans', (_req, res) => {
   res.json({
     data: {
@@ -375,11 +454,7 @@ app.get('/api/plans', (_req, res) => {
   });
 });
 
-/**
- * GET /api/checkout/config
- * Public checkout settings for a plan: Stripe publishable key, plan and prices.
- */
-app.get('/api/checkout/config', (req, res) => {
+app.get('/api/checkout/config', validate(checkoutConfigQuerySchema), (req, res) => {
   const config = getCheckoutConfig({
     planId: req.query.plan,
     billing: req.query.billing,
@@ -392,15 +467,10 @@ app.get('/api/checkout/config', (req, res) => {
   return res.json({ data: config });
 });
 
-/**
- * POST /api/checkout/payment-intent
- * Creates a Stripe PaymentIntent for the selected plan and currency. The
- * amount is always decided on the server; the client only sends identifiers.
- */
-app.post('/api/checkout/payment-intent', checkoutLimiter, optionalAuth, async (req, res) => {
+app.post('/api/checkout/payment-intent', checkoutLimiter, optionalSessionAuth, validate(paymentIntentBodySchema), async (req, res) => {
   try {
-    const planId = req.body?.planId ?? req.query.plan ?? 'growth';
-    const billing = req.body?.billing ?? req.query.billing ?? 'monthly';
+    const planId = req.body.planId ?? 'growth';
+    const billing = req.body.billing ?? 'monthly';
     const config = getCheckoutConfig({ planId, billing });
 
     if (!config) {
@@ -410,7 +480,7 @@ app.post('/api/checkout/payment-intent', checkoutLimiter, optionalAuth, async (r
       return res.status(503).json({ error: 'Stripe is not configured on the server' });
     }
 
-    const price = getPrice(req.body?.currency, planId, billing);
+    const price = getPrice(req.body.currency, planId, billing);
     if (!price) {
       return res.status(400).json({ error: 'Unsupported currency' });
     }
@@ -418,10 +488,8 @@ app.post('/api/checkout/payment-intent', checkoutLimiter, optionalAuth, async (r
       return res.status(400).json({ error: 'This plan is free — no payment is required' });
     }
 
-    const email = String(req.body?.email ?? '').trim();
-    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      return res.status(400).json({ error: 'Enter a valid email address' });
-    }
+    const email = req.body.email ?? '';
+    const userId = req.user ? String(req.user._id ?? req.user.id) : '';
 
     const intent = await getStripe().paymentIntents.create({
       amount: price.amount,
@@ -434,7 +502,7 @@ app.post('/api/checkout/payment-intent', checkoutLimiter, optionalAuth, async (r
         planName: config.plan.name,
         billing: config.plan.billing,
         displayPrice: price.display,
-        userId: req.user ? String(req.user._id ?? req.user.id) : '',
+        userId,
         email,
       },
     });
@@ -462,17 +530,9 @@ app.post('/api/checkout/payment-intent', checkoutLimiter, optionalAuth, async (r
   }
 });
 
-/**
- * POST /api/checkout/confirm
- * Called after Stripe.js confirms the card payment. The intent is re-fetched
- * from Stripe so the client cannot fake a successful payment.
- */
-app.post('/api/checkout/confirm', checkoutLimiter, optionalAuth, async (req, res) => {
+app.post('/api/checkout/confirm', checkoutLimiter, optionalSessionAuth, validate(checkoutConfirmBodySchema), async (req, res) => {
   try {
-    const paymentIntentId = String(req.body?.paymentIntentId ?? '').trim();
-    if (!paymentIntentId.startsWith('pi_')) {
-      return res.status(400).json({ error: 'Invalid payment intent id' });
-    }
+    const paymentIntentId = req.body.paymentIntentId;
 
     const intent = await getStripe().paymentIntents.retrieve(paymentIntentId);
 
@@ -504,18 +564,10 @@ app.post('/api/checkout/confirm', checkoutLimiter, optionalAuth, async (req, res
   }
 });
 
-/**
- * GET /api/checkout/payments/:paymentIntentId
- * Returns the stored checkout payment record (email + plan) for a
- * payment-intent id.
- */
-app.get('/api/checkout/payments/:paymentIntentId', async (req, res) => {
+app.get('/api/checkout/payments/:paymentIntentId', validate(paymentParamSchema), async (req, res) => {
   try {
-    const paymentIntentId = String(req.params.paymentIntentId ?? '').trim();
+    const paymentIntentId = req.params.paymentIntentId;
     const isCheckoutSession = paymentIntentId.startsWith('cs_');
-    if (!paymentIntentId.startsWith('pi_') && !isCheckoutSession) {
-      return res.status(400).json({ error: 'Invalid payment intent id' });
-    }
 
     const payment = await client
       .db(dbName)
@@ -542,8 +594,6 @@ app.get('/api/checkout/payments/:paymentIntentId', async (req, res) => {
       });
     }
 
-    // Hosted Checkout Sessions that were not persisted yet — fall back to
-    // Stripe so the success screen can still render a confirmed payment.
     if (isCheckoutSession) {
       try {
         const session = await getStripe().checkout.sessions.retrieve(paymentIntentId, {
@@ -568,10 +618,6 @@ app.get('/api/checkout/payments/:paymentIntentId', async (req, res) => {
   }
 });
 
-/**
- * Normalizes a Stripe Checkout Session into the payment/plan fields used by
- * the success screen and the payments ledger. Stripe is the source of truth.
- */
 function buildCheckoutSessionData(session, user = null) {
   const paid = session.payment_status === 'paid';
   const metadata = session.metadata || {};
@@ -669,17 +715,9 @@ async function recordCheckoutSession(session, user = null) {
   };
 }
 
-/**
- * GET /api/checkout/session/:sessionId
- * Retrieves a hosted Stripe Checkout Session by id and returns the payment +
- * plan details for the success screen. Stripe is the source of truth.
- */
-app.get('/api/checkout/session/:sessionId', optionalAuth, async (req, res) => {
+app.get('/api/checkout/session/:sessionId', optionalSessionAuth, validate(checkoutSessionParamSchema), async (req, res) => {
   try {
-    const sessionId = String(req.params.sessionId ?? '').trim();
-    if (!sessionId.startsWith('cs_')) {
-      return res.status(400).json({ error: 'Invalid checkout session id' });
-    }
+    const sessionId = req.params.sessionId;
 
     const session = await getStripe().checkout.sessions.retrieve(sessionId, {
       expand: ['line_items', 'payment_intent', 'customer'],
@@ -701,19 +739,15 @@ app.get('/api/checkout/session/:sessionId', optionalAuth, async (req, res) => {
     const status =
       err?.statusCode ??
       (err?.type === 'StripeInvalidRequestError' ? 404 : 502);
-    return res.status(status).json({ error: err?.message || 'Could not load checkout session' });
+return res.status(status).json({ error: err?.message || 'Could not load checkout session' });
   }
 });
 
-/**
- * POST /api/checkout/session
- * Creates a hosted Stripe Checkout Session (full page) for a plan/billing pair.
- */
-app.post('/api/checkout/session', checkoutLimiter, optionalAuth, async (req, res) => {
+app.post('/api/checkout/session', checkoutLimiter, optionalSessionAuth, validate(checkoutSessionBodySchema), async (req, res) => {
   try {
     const config = getCheckoutConfig({
-      planId: req.body?.planId,
-      billing: req.body?.billing,
+      planId: req.body.planId,
+      billing: req.body.billing,
     });
 
     if (!config) {
@@ -731,11 +765,7 @@ app.post('/api/checkout/session', checkoutLimiter, optionalAuth, async (req, res
       return res.status(400).json({ error: 'This plan is free — no checkout required' });
     }
 
-    const email = String(req.body?.email ?? '').trim();
-    if (email && !/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(email)) {
-      return res.status(400).json({ error: 'Enter a valid email address' });
-    }
-
+    const email = req.body.email ?? '';
     const userId = req.user ? String(req.user._id ?? req.user.id) : '';
     const session = await createCheckoutSession({
       planId,
@@ -755,12 +785,6 @@ app.post('/api/checkout/session', checkoutLimiter, optionalAuth, async (req, res
       },
     });
   } catch (err) {
-    try {
-      require("fs").writeFileSync(
-        process.cwd() + "/tmp-checkout-session-error.json",
-        JSON.stringify({ type: err?.type, message: err?.message, statusCode: err?.statusCode, stack: err?.stack }),
-      );
-    } catch {}
     console.error('POST checkout session error:', err?.message ?? err);
     const status =
       err?.statusCode ??
@@ -771,20 +795,10 @@ app.post('/api/checkout/session', checkoutLimiter, optionalAuth, async (req, res
   }
 });
 
-/**
- * GET /api/billing/summary
- * Current plan, billing status, renewal date and payment method for the
- * logged-in user. Reads the payments ledger first, then enriches with Stripe.
- */
-app.get('/api/billing/summary', optionalAuth, async (req, res) => {
+app.get('/api/billing/summary', requireSessionAuth, async (req, res) => {
   try {
-    if (!req.user) {
-      return res.status(401).json({ error: 'Authentication required' });
-    }
-
     const userId = String(req.user._id ?? req.user.id);
     const db = client.db(dbName);
-
     const userIds = [userId];
     if (ObjectId.isValid(userId)) {
       userIds.push(new ObjectId(userId));
@@ -863,7 +877,6 @@ app.get('/api/billing/summary', optionalAuth, async (req, res) => {
         status = latest.status === 'success' ? 'Active' : latest.status === 'failed' ? 'Past due' : 'Pending';
       }
 
-      // Calculate fallback renewal date (1 month or 1 year from payment)
       if (!renewalDate && latest.createdAt) {
         const nextDate = new Date(latest.createdAt);
         if (isYearly) {
@@ -893,7 +906,6 @@ app.get('/api/billing/summary', optionalAuth, async (req, res) => {
       status = 'Active';
     }
 
-    // Free plan application usage
     const applicationCountForSummary = await db
       .collection(applicationsCollectionName)
       .countDocuments({
@@ -907,7 +919,6 @@ app.get('/api/billing/summary', optionalAuth, async (req, res) => {
       ? Math.max(0, FREE_PLAN_APPLICATION_LIMIT - applicationCountForSummary)
       : null;
 
-    // Try finding Stripe customer if missing
     if (!stripeCustomerId && req.user.email) {
       try {
         const customers = await getStripe().customers.list({
@@ -922,9 +933,7 @@ app.get('/api/billing/summary', optionalAuth, async (req, res) => {
               .updateOne({ _id: latest._id }, { $set: { stripeCustomerId } });
           }
         }
-      } catch (custErr) {
-        // Optional lookup
-      }
+      } catch (custErr) {}
     }
 
     if (stripeCustomerId) {
@@ -982,16 +991,8 @@ app.get('/api/billing/summary', optionalAuth, async (req, res) => {
   }
 });
 
-/**
- * GET /api/billing/history
- * Payment history for the logged-in user, newest first.
- */
-app.get('/api/billing/history', optionalAuth, async (req, res) => {
+app.get('/api/billing/history', requireSessionAuth, async (req, res) => {
   try {
-    if (!req.user) {
-      return res.status(401).json({ error: 'Authentication required' });
-    }
-
     const userId = String(req.user._id ?? req.user.id);
     const db = client.db(dbName);
     const userIds = [userId];
@@ -1045,16 +1046,8 @@ app.get('/api/billing/history', optionalAuth, async (req, res) => {
   }
 });
 
-/**
- * POST /api/billing/portal
- * Creates a Stripe Billing Portal session for the logged-in user.
- */
-app.post('/api/billing/portal', optionalAuth, async (req, res) => {
+app.post('/api/billing/portal', requireSessionAuth, validate(billingPortalBodySchema), async (req, res) => {
   try {
-    if (!req.user) {
-      return res.status(401).json({ error: 'Authentication required' });
-    }
-
     const userId = String(req.user._id ?? req.user.id);
     const db = client.db(dbName);
     const userIds = [userId];
@@ -1113,10 +1106,6 @@ app.post('/api/billing/portal', optionalAuth, async (req, res) => {
   }
 });
 
-/**
- * GET /api/stats
- * Platform statistics for the hero section.
- */
 app.get('/api/stats', async (_req, res) => {
   try {
     const db = client.db(dbName);
@@ -1296,10 +1285,9 @@ app.get('/api/companies', async (_req, res) => {
   }
 });
 
-app.get('/api/companies/:slug', async (req, res) => {
+app.get('/api/companies/:slug', validate(companySlugParamSchema), async (req, res) => {
   try {
-    const slug = String(req.params.slug ?? '');
-    if (!slug) return res.status(400).json({ error: 'Invalid company' });
+    const slug = req.params.slug;
     const db = client.db(dbName);
     const [jobs, recruiters] = await Promise.all([
       db.collection(jobsCollectionName)
@@ -1377,37 +1365,30 @@ function toJobDetail(doc, isOwner, hasApplied, isSaved) {
   return job;
 }
 
-/**
- * GET /api/dashboard
- * Query: q, type (csv), workMode, level, salaryMin, sort (newest|salary), page, limit
- * Response: { data: Job[], meta: { page, limit, total, totalPages, facets } }
- */
-const handleGetDashboard = async (req, res) => {
+app.get('/api/dashboard', requireSessionAuth, async (req, res) => {
   try {
     const db = client.db(dbName);
-    const userId = req.user ? String(req.user._id ?? req.user.id) : String(req.query.userId ?? '');
+    const userId = String(req.user._id ?? req.user.id);
 
-    let savedJobsCount = 12;
-    let applicationsCount = 24;
-    let interviewsCount = 3;
-    let offersCount = 1;
+    let savedJobsCount = 0;
+    let applicationsCount = 0;
+    let interviewsCount = 0;
+    let offersCount = 0;
 
-    if (userId) {
-      const realSaved = await db.collection(savedJobsCollectionName).countDocuments({
-        $or: [
-          { userId },
-          ...(ObjectId.isValid(userId) ? [{ userId: new ObjectId(userId) }] : []),
-        ],
-      });
-      const realApplied = await db.collection(applicationsCollectionName).countDocuments({
-        $or: [
-          { userId },
-          ...(ObjectId.isValid(userId) ? [{ userId: new ObjectId(userId) }] : []),
-        ],
-      });
-      if (realSaved > 0) savedJobsCount = realSaved;
-      if (realApplied > 0) applicationsCount = realApplied;
-    }
+    const realSaved = await db.collection(savedJobsCollectionName).countDocuments({
+      $or: [
+        { userId },
+        ...(ObjectId.isValid(userId) ? [{ userId: new ObjectId(userId) }] : []),
+      ],
+    });
+    const realApplied = await db.collection(applicationsCollectionName).countDocuments({
+      $or: [
+        { userId },
+        ...(ObjectId.isValid(userId) ? [{ userId: new ObjectId(userId) }] : []),
+      ],
+    });
+    savedJobsCount = realSaved;
+    applicationsCount = realApplied;
 
     const recentActivity = [
       {
@@ -1465,39 +1446,17 @@ const handleGetDashboard = async (req, res) => {
     console.error('GET dashboard error:', err?.message ?? err);
     res.status(500).json({ error: 'Internal server error' });
   }
-};
+});
 
-app.get('/api/dashboard', optionalAuth, handleGetDashboard);
-
-/**
- * GET /api/jobs
- * Query: q, status (open|closed), type (csv), workMode, level, salaryMin, sort (newest|salary), page, limit
- * Response: { data: Job[], meta: { page, limit, total, totalPages, facets } }
- */
 const handleGetJobs = async (req, res) => {
   try {
-    const q = String(req.query.q ?? '').trim();
-    const status = String(req.query.status ?? '').trim().toLowerCase();
-    if (status && !['open', 'closed'].includes(status)) {
-      return res.status(400).json({ error: 'status must be open or closed' });
-    }
-    const types = String(req.query.type ?? '')
-      .split(',')
-      .map((t) => t.trim())
-      .filter(Boolean);
-    const workMode = String(req.query.workMode ?? '').trim();
-    const level = String(req.query.level ?? '').trim();
-    const salaryMin = String(req.query.salaryMin ?? '').trim();
-    const sort = String(req.query.sort ?? 'newest') === 'salary' ? 'salary' : 'newest';
-    const page = Math.max(1, parseInt(String(req.query.page ?? '1'), 10) || 1);
-    const limit = Math.min(50, Math.max(1, parseInt(String(req.query.limit ?? '10'), 10) || 10));
+    const { q, status, type, workMode, level, salaryMin, sort, page, limit } = req.query;
 
     const db = client.db(dbName);
     const jobs = await db.collection(jobsCollectionName)
       .find({ isDeleted: { $ne: true } })
       .toArray();
 
-    // Full-text-ish search across title / company / location.
     const searched = q
       ? jobs.filter((job) => {
           const haystack = `${job.title ?? ''} ${job.companyName ?? ''} ${job.location ?? ''}`.toLowerCase();
@@ -1505,7 +1464,6 @@ const handleGetJobs = async (req, res) => {
         })
       : jobs;
 
-    // Facets: job-type counts for the current search (before type filtering).
     const typeCounts = {};
     for (const job of searched) {
       const key = normalizeTypeKey(job.type);
@@ -1530,7 +1488,8 @@ const handleGetJobs = async (req, res) => {
           return false;
         }
       }
-      if (types.length > 0) {
+      if (type) {
+        const types = String(type).split(',').map(t => t.trim()).filter(Boolean);
         const matchesType = types.some(
           (t) => String(job.type ?? '').toLowerCase() === t.toLowerCase(),
         );
@@ -1581,49 +1540,30 @@ const handleGetJobs = async (req, res) => {
   }
 };
 
-app.get('/api/jobs', handleGetJobs);
+app.get('/api/jobs', validate(jobFiltersQuerySchema), handleGetJobs);
 
-/**
- * POST /api/jobs
- * Creates a job listing for an authenticated recruiter.
- */
 const handleCreateJob = async (req, res) => {
   try {
-    if (!req.user) {
-      return res.status(401).json({ error: 'Authentication required' });
-    }
-
     const role = String(req.user.role ?? '').toLowerCase();
     if (role !== 'recruiter' && role !== 'admin') {
       return res.status(403).json({ error: 'Only recruiters can publish jobs' });
     }
 
-    const input = req.body?.job && typeof req.body.job === 'object'
-      ? req.body.job
-      : req.body;
-    const title = String(input.title ?? input.jobTitle ?? '').trim();
-    const companyName = String(input.companyName ?? input.company ?? '').trim();
-    const description = String(input.description ?? '').trim();
-    const location = String(input.location ?? '').trim();
-    const missingFields = [];
-    if (!title) missingFields.push('title');
-    if (!companyName) missingFields.push('companyName');
-    if (!description) missingFields.push('description');
-    if (!location) missingFields.push('location');
-    if (missingFields.length) {
-      return res.status(400).json({
-        error: 'Required job fields are missing',
-        fields: missingFields,
-      });
-    }
+    const input = req.body;
+    const title = input.title;
+    const companyName = input.companyName;
+    const description = input.description;
+    const location = input.location;
 
     const parseList = (value, field) => {
       if (value == null || value === '') return [];
-      const items = Array.isArray(value) ? value : String(value).split(/\r?\n/);
-      if (!items.every((item) => typeof item === 'string')) {
+      if (!Array.isArray(value)) {
+        throw new Error(`${field} must be an array of strings`);
+      }
+      if (!value.every((item) => typeof item === 'string')) {
         throw new Error(`${field} must be a list of strings`);
       }
-      return items.map((item) => item.trim()).filter(Boolean);
+      return value.map((item) => item.trim()).filter(Boolean);
     };
 
     const parseSalary = (value, field) => {
@@ -1646,7 +1586,7 @@ const handleCreateJob = async (req, res) => {
       salaryMin = parseSalary(input.salaryMin, 'salaryMin');
       salaryMax = parseSalary(input.salaryMax, 'salaryMax');
       responsibilities = parseList(input.responsibilities, 'responsibilities');
-      requirements = parseList(input.requirements ?? input.qualifications, 'requirements');
+      requirements = parseList(input.requirements, 'requirements');
       skills = parseList(input.skills, 'skills');
       benefits = parseList(input.benefits, 'benefits');
       if (input.applicationDeadline) {
@@ -1677,16 +1617,16 @@ const handleCreateJob = async (req, res) => {
       requirements,
       skills,
       benefits,
-      type: String(input.type ?? input.jobType ?? 'Full-time').trim(),
-      workMode: String(input.workMode ?? (input.remote ? 'Remote' : '')).trim(),
-      level: String(input.level ?? input.experienceLevel ?? '').trim(),
+      type: input.type ?? 'Full-time',
+      workMode: input.workMode ?? (input.remote ? 'Remote' : ''),
+      level: input.level ?? '',
       salaryMin,
       salaryMax,
-      currency: String(input.currency ?? 'USD').trim(),
-      salaryFrequency: String(input.salaryFrequency ?? input.frequency ?? '').trim(),
+      currency: input.currency ?? 'USD',
+      salaryFrequency: input.salaryFrequency ?? '',
       applicationDeadline,
-      companyOverview: input.companyOverview == null ? null : String(input.companyOverview).trim(),
-      logoUrl: input.logoUrl == null ? null : String(input.logoUrl).trim(),
+      companyOverview: input.companyOverview ?? null,
+      logoUrl: input.logoUrl ?? null,
       remote: input.remote === true || String(input.workMode ?? '').toLowerCase() === 'remote',
       easyApply: input.easyApply === true,
       hot: false,
@@ -1711,19 +1651,12 @@ const handleCreateJob = async (req, res) => {
   }
 };
 
-app.post('/api/jobs', requireSessionAuth, handleCreateJob);
-app.post('/jobs', requireSessionAuth, handleCreateJob);
+app.post('/api/jobs', requireSessionAuth, requireRole('recruiter', 'admin'), validate(createJobBodySchema), handleCreateJob);
+app.post('/jobs', requireSessionAuth, requireRole('recruiter', 'admin'), validate(createJobBodySchema), handleCreateJob);
 
-/**
- * GET /api/jobs/:id
- */
 const handleGetJobById = async (req, res) => {
   try {
     const { id } = req.params;
-    if (!id || id.length !== 24 || !ObjectId.isValid(id)) {
-      return res.status(400).json({ error: 'Invalid job id' });
-    }
-
     const db = client.db(dbName);
     const doc = await db.collection(jobsCollectionName).findOne({
       _id: new ObjectId(id),
@@ -1771,17 +1704,11 @@ const handleGetJobById = async (req, res) => {
   }
 };
 
-app.get('/api/jobs/:id', optionalAuth, handleGetJobById);
+app.get('/api/jobs/:id', validate(objectIdParamSchema), optionalSessionAuth, handleGetJobById);
 
-/**
- * POST /api/jobs/:id/apply
- */
 const handleApplyToJob = async (req, res) => {
   try {
-    const jobId = String(req.params.id ?? '');
-    if (!ObjectId.isValid(jobId) || jobId.length !== 24) {
-      return res.status(400).json({ error: 'Invalid job id' });
-    }
+    const jobId = req.params.id;
 
     if (!req.user) {
       return res.status(401).json({ error: 'Authentication required' });
@@ -1820,7 +1747,6 @@ const handleApplyToJob = async (req, res) => {
       return res.status(409).json({ error: 'Already applied for this job', hasApplied: true });
     }
 
-    // Free plan application limit
     const userIdStrForPlan = String(req.user._id ?? req.user.id);
     const planFilter = {
       $or: [
@@ -1893,7 +1819,7 @@ const handleApplyToJob = async (req, res) => {
   }
 };
 
-app.post('/api/jobs/:id/apply', optionalAuth, handleApplyToJob);
+app.post('/api/jobs/:id/apply', requireSessionAuth, requireRole('seeker'), validate(objectIdParamSchema), validate(applyJobBodySchema), handleApplyToJob);
 
 const applicationStatuses = new Set([
   'applied',
@@ -1908,25 +1834,12 @@ const applicationStatuses = new Set([
   'withdrawn',
 ]);
 
-app.patch('/api/applications/:id/status', requireSessionAuth, async (req, res) => {
+app.patch('/api/applications/:id/status', requireSessionAuth, requireRole('recruiter', 'admin'), validate(objectIdParamSchema), validate(applicationStatusBodySchema), async (req, res) => {
   try {
-    if (!ObjectId.isValid(req.params.id)) {
-      return res.status(400).json({ error: 'Invalid application id' });
-    }
-
-    const status = String(req.body?.status ?? '').trim().toLowerCase().replace(/[\s-]+/g, '_');
-    if (!applicationStatuses.has(status)) {
-      return res.status(400).json({
-        error: 'Invalid application status',
-        allowedStatuses: [...applicationStatuses],
-      });
-    }
+    const status = req.body.status;
 
     const user = req.user;
     const role = String(user.role ?? '').toLowerCase();
-    if (role !== 'recruiter' && role !== 'admin') {
-      return res.status(403).json({ error: 'Only recruiters can update application status' });
-    }
 
     const db = client.db(dbName);
     const applications = db.collection(applicationsCollectionName);
@@ -1975,13 +1888,9 @@ app.patch('/api/applications/:id/status', requireSessionAuth, async (req, res) =
   }
 });
 
-/**
- * GET /api/saved-jobs
- */
 const handleGetSavedJobs = async (req, res) => {
   try {
-    const userId = req.user ? String(req.user._id ?? req.user.id) : String(req.query.userId ?? req.body?.userId ?? '');
-    if (!userId) return res.json([]);
+    const userId = String(req.user._id ?? req.user.id);
 
     const docs = await client
       .db(dbName)
@@ -1997,25 +1906,19 @@ const handleGetSavedJobs = async (req, res) => {
     const ids = docs
       .map((doc) => String(doc.jobId ?? ''))
       .filter(Boolean);
-    res.json(ids);
+    res.json({ data: ids });
   } catch (err) {
     console.error('GET saved-jobs error:', err?.message ?? err);
     res.status(500).json({ error: 'Internal server error' });
   }
 };
 
-app.get('/api/saved-jobs', optionalAuth, handleGetSavedJobs);
+app.get('/api/saved-jobs', requireSessionAuth, handleGetSavedJobs);
 
-/**
- * POST /api/jobs/:id/save
- */
 const handleSaveJob = async (req, res) => {
   try {
-    const userId = req.user ? String(req.user._id ?? req.user.id) : String(req.query.userId ?? req.body?.userId ?? '');
-    const jobId = String(req.params.id ?? '');
-    if (!userId || !jobId) {
-      return res.status(400).json({ error: 'userId and jobId are required' });
-    }
+    const userId = String(req.user._id ?? req.user.id);
+    const jobId = req.params.id;
     const db = client.db(dbName);
     await db
       .collection(savedJobsCollectionName)
@@ -2031,18 +1934,12 @@ const handleSaveJob = async (req, res) => {
   }
 };
 
-app.post('/api/jobs/:id/save', optionalAuth, handleSaveJob);
+app.post('/api/jobs/:id/save', requireSessionAuth, requireRole('seeker'), validate(objectIdParamSchema), validate(saveJobBodySchema), handleSaveJob);
 
-/**
- * DELETE /api/jobs/:id/save
- */
 const handleDeleteSavedJob = async (req, res) => {
   try {
-    const userId = req.user ? String(req.user._id ?? req.user.id) : String(req.query.userId ?? req.body?.userId ?? '');
-    const jobId = String(req.params.id ?? '');
-    if (!userId || !jobId) {
-      return res.status(400).json({ error: 'userId and jobId are required' });
-    }
+    const userId = String(req.user._id ?? req.user.id);
+    const jobId = req.params.id;
     const db = client.db(dbName);
     await db
       .collection(savedJobsCollectionName)
@@ -2054,7 +1951,67 @@ const handleDeleteSavedJob = async (req, res) => {
   }
 };
 
-app.delete('/api/jobs/:id/save', optionalAuth, handleDeleteSavedJob);
+app.delete('/api/jobs/:id/save', requireSessionAuth, requireRole('seeker'), validate(objectIdParamSchema), handleDeleteSavedJob);
+
+const handleGetMyJobIds = async (req, res) => {
+  try {
+    const userId = String(req.user._id ?? req.user.id);
+    const docs = await client
+      .db(dbName)
+      .collection(applicationsCollectionName)
+      .find({
+        $or: [
+          { userId },
+          ...(ObjectId.isValid(userId) ? [{ userId: new ObjectId(userId) }] : []),
+          { seekerId: userId },
+          ...(ObjectId.isValid(userId) ? [{ seekerId: new ObjectId(userId) }] : []),
+        ],
+      })
+      .project({ jobId: 1 })
+      .toArray();
+
+    const jobIds = docs.map((doc) => String(doc.jobId)).filter(Boolean);
+    res.json({ data: jobIds });
+  } catch (err) {
+    console.error('GET my-job-ids error:', err?.message ?? err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+app.get('/api/applications/my-job-ids', requireSessionAuth, handleGetMyJobIds);
+
+const handleTrackActivity = async (req, res) => {
+  try {
+    const userId = String(req.user._id ?? req.user.id);
+    const { event, jobId, metadata } = req.body;
+
+    const doc = {
+      userId,
+      event,
+      jobId: jobId || null,
+      metadata: metadata ?? null,
+      createdAt: new Date(),
+      updatedAt: new Date(),
+    };
+
+    const result = await client.db(dbName).collection(activitiesCollectionName).insertOne(doc);
+    res.json({ ok: true, id: String(result.insertedId) });
+  } catch (err) {
+    console.error('POST activity/track error:', err?.message ?? err);
+    res.status(500).json({ error: 'Internal server error' });
+  }
+};
+
+app.post('/api/activity/track', requireSessionAuth, validate(activityTrackBodySchema), handleTrackActivity);
+
+app.use((err, _req, res, _next) => {
+  console.error('Unhandled error:', err?.message ?? err);
+  const isProduction = process.env.NODE_ENV === 'production';
+  res.status(500).json({
+    error: 'Internal server error',
+    ...(isProduction ? {} : { message: err?.message, stack: err?.stack }),
+  });
+});
 
 async function run() {
   try {
@@ -2066,8 +2023,11 @@ async function run() {
   }
 }
 
-app.listen(PORT, () => {
-  console.log(`Server listening on port ${PORT}`);
-});
+if (require.main === module && !process.env.VERCEL) {
+  app.listen(PORT, () => {
+    console.log(`Server listening on port ${PORT}`);
+  });
+  run();
+}
 
-run();
+module.exports = app;
