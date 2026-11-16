@@ -6,6 +6,7 @@ const express = require('express');
 const cors = require('cors');
 const { rateLimit } = require('express-rate-limit');
 const helmet = require('helmet');
+const multer = require('multer');
 const { z } = require('zod');
 const { getBetterAuthSessionToken } = require('./lib/better-auth-session');
 const {
@@ -70,6 +71,20 @@ app.use(helmet({
 }));
 
 app.use(express.json({ limit: '100kb' }));
+
+const avatarUpload = multer({
+  storage: multer.memoryStorage(),
+  limits: { fileSize: 4 * 1024 * 1024 },
+  fileFilter(_req, file, cb) {
+    if (file.mimetype === 'image/jpeg' || file.mimetype === 'image/png') {
+      cb(null, true);
+      return;
+    }
+    const error = new Error('INVALID_AVATAR_TYPE');
+    error.code = 'INVALID_AVATAR_TYPE';
+    cb(error);
+  },
+});
 
 const sanitize = (obj) => {
   if (obj && typeof obj === 'object') {
@@ -2005,6 +2020,73 @@ const handleTrackActivity = async (req, res) => {
 };
 
 app.post('/api/activity/track', requireSessionAuth, validate(activityTrackBodySchema), handleTrackActivity);
+
+app.post('/api/profile/avatar', requireSessionAuth, (req, res) => {
+  avatarUpload.single('avatar')(req, res, async (uploadErr) => {
+    if (uploadErr) {
+      if (uploadErr.code === 'LIMIT_FILE_SIZE') {
+        return res.status(400).json({ error: 'Image must be 4MB or smaller.' });
+      }
+      if (uploadErr.code === 'INVALID_AVATAR_TYPE') {
+        return res.status(400).json({ error: 'Only JPG and PNG images are allowed.' });
+      }
+      return res.status(400).json({ error: 'Could not upload image.' });
+    }
+
+    if (!req.file || !req.file.buffer) {
+      return res.status(400).json({ error: 'Avatar image file is required.' });
+    }
+
+    if (req.file.mimetype !== 'image/jpeg' && req.file.mimetype !== 'image/png') {
+      return res.status(400).json({ error: 'Only JPG and PNG images are allowed.' });
+    }
+
+    const imgbbApiKey = process.env.IMGBB_API_KEY;
+    if (!imgbbApiKey) {
+      return res.status(503).json({ error: 'Avatar upload is not configured.' });
+    }
+
+    try {
+      const formData = new URLSearchParams();
+      formData.set('image', req.file.buffer.toString('base64'));
+
+      const imgbbResponse = await fetch(
+        `https://api.imgbb.com/1/upload?key=${encodeURIComponent(imgbbApiKey)}`,
+        {
+          method: 'POST',
+          headers: { 'Content-Type': 'application/x-www-form-urlencoded' },
+          body: formData,
+        },
+      );
+
+      const imgbbPayload = await imgbbResponse.json().catch(() => null);
+      const imageUrl = imgbbPayload?.data?.display_url;
+
+      if (!imgbbResponse.ok || !imageUrl) {
+        console.error('ImgBB upload failed:', imgbbResponse.status);
+        return res.status(502).json({ error: 'Could not upload image.' });
+      }
+
+      const userId = req.user?._id;
+      if (!userId) {
+        return res.status(401).json({ error: 'Authentication required' });
+      }
+
+      const userObjectId =
+        userId instanceof ObjectId ? userId : new ObjectId(String(userId));
+
+      await client.db(dbName).collection('user').updateOne(
+        { _id: userObjectId },
+        { $set: { image: imageUrl, updatedAt: new Date() } },
+      );
+
+      return res.json({ data: { image: imageUrl } });
+    } catch (err) {
+      console.error('POST profile avatar error:', err?.message ?? err);
+      return res.status(502).json({ error: 'Could not upload image.' });
+    }
+  });
+});
 
 app.use((err, _req, res, _next) => {
   console.error('Unhandled error:', err?.message ?? err);
