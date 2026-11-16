@@ -8,6 +8,7 @@ const { rateLimit } = require('express-rate-limit');
 const helmet = require('helmet');
 const multer = require('multer');
 const { z } = require('zod');
+const { createRemoteJWKSet, jwtVerify } = require('jose');
 const { getBetterAuthSessionToken } = require('./lib/better-auth-session');
 const {
   createCheckoutSession,
@@ -160,27 +161,108 @@ async function resolveSessionUserFromReq(req, db) {
   });
 }
 
-async function requireSessionAuth(req, res, next) {
+let cachedJWKS = null;
+let cachedJwksUrl = null;
+
+function getJWKS() {
+  const jwksUrl = process.env.BETTER_AUTH_JWKS_URL;
+  if (!jwksUrl) return null;
+  if (!cachedJWKS || cachedJwksUrl !== jwksUrl) {
+    cachedJWKS = createRemoteJWKSet(new URL(jwksUrl));
+    cachedJwksUrl = jwksUrl;
+  }
+  return cachedJWKS;
+}
+
+function getBearerToken(req) {
+  const authHeader = req.headers.authorization;
+  if (typeof authHeader !== 'string') return null;
+  const match = authHeader.match(/^Bearer\s+(.+)$/i);
+  if (!match) return null;
+  const token = match[1].trim();
+  return token || null;
+}
+
+async function resolveJwtUser(req, db) {
+  const token = getBearerToken(req);
+  if (!token) return { provided: false, user: null };
+
+  const jwks = getJWKS();
+  const issuer = process.env.JWT_ISSUER;
+  const audience = process.env.JWT_AUDIENCE;
+  if (!jwks || !issuer || !audience) {
+    return { provided: true, user: null, invalid: true };
+  }
+
   try {
-    req.user = await resolveSessionUserFromReq(req, client.db(dbName));
+    const { payload } = await jwtVerify(token, jwks, {
+      issuer,
+      audience,
+      algorithms: ['EdDSA'],
+      clockTolerance: 5,
+    });
+
+    const sub = typeof payload.sub === 'string' ? payload.sub : null;
+    if (!sub) return { provided: true, user: null, invalid: true };
+
+    const user = await db.collection('user').findOne({
+      $or: [
+        { id: sub },
+        ...(ObjectId.isValid(sub) ? [{ _id: new ObjectId(sub) }] : []),
+      ],
+    });
+
+    if (!user) return { provided: true, user: null, invalid: true };
+    return { provided: true, user };
+  } catch {
+    return { provided: true, user: null, invalid: true };
+  }
+}
+
+async function requireAuth(req, res, next) {
+  try {
+    const db = client.db(dbName);
+    const jwtResult = await resolveJwtUser(req, db);
+    if (jwtResult.provided) {
+      if (jwtResult.user) {
+        req.user = jwtResult.user;
+        return next();
+      }
+      return res.status(401).json({ error: 'Invalid or expired token' });
+    }
+
+    req.user = await resolveSessionUserFromReq(req, db);
     if (!req.user) {
       return res.status(401).json({ error: 'Authentication required' });
     }
     return next();
   } catch (err) {
-    console.error('Session authentication failed:', err?.message ?? err);
+    console.error('Authentication failed:', err?.message ?? err);
     return res.status(500).json({ error: 'Could not verify session' });
   }
 }
 
-async function optionalSessionAuth(req, res, next) {
+async function optionalAuth(req, res, next) {
   try {
-    req.user = await resolveSessionUserFromReq(req, client.db(dbName));
+    const db = client.db(dbName);
+    const jwtResult = await resolveJwtUser(req, db);
+    if (jwtResult.provided) {
+      req.user = jwtResult.user || null;
+      return next();
+    }
+
+    try {
+      req.user = await resolveSessionUserFromReq(req, db);
+    } catch (err) {
+      console.error('optionalAuth session error:', err?.message ?? err);
+      req.user = null;
+    }
+    return next();
   } catch (err) {
-    console.error('optionalSessionAuth error:', err);
+    console.error('optionalAuth error:', err?.message ?? err);
     req.user = null;
+    return next();
   }
-  next();
 }
 
 function requireRole(...allowedRoles) {
@@ -486,7 +568,7 @@ app.get('/api/checkout/config', validate(checkoutConfigQuerySchema), (req, res) 
   return res.json({ data: config });
 });
 
-app.post('/api/checkout/payment-intent', checkoutLimiter, optionalSessionAuth, validate(paymentIntentBodySchema), async (req, res) => {
+app.post('/api/checkout/payment-intent', checkoutLimiter, optionalAuth, validate(paymentIntentBodySchema), async (req, res) => {
   try {
     const planId = req.body.planId ?? 'growth';
     const billing = req.body.billing ?? 'monthly';
@@ -549,7 +631,7 @@ app.post('/api/checkout/payment-intent', checkoutLimiter, optionalSessionAuth, v
   }
 });
 
-app.post('/api/checkout/confirm', checkoutLimiter, optionalSessionAuth, validate(checkoutConfirmBodySchema), async (req, res) => {
+app.post('/api/checkout/confirm', checkoutLimiter, optionalAuth, validate(checkoutConfirmBodySchema), async (req, res) => {
   try {
     const paymentIntentId = req.body.paymentIntentId;
 
@@ -734,7 +816,7 @@ async function recordCheckoutSession(session, user = null) {
   };
 }
 
-app.get('/api/checkout/session/:sessionId', optionalSessionAuth, validate(checkoutSessionParamSchema), async (req, res) => {
+app.get('/api/checkout/session/:sessionId', optionalAuth, validate(checkoutSessionParamSchema), async (req, res) => {
   try {
     const sessionId = req.params.sessionId;
 
@@ -762,7 +844,7 @@ return res.status(status).json({ error: err?.message || 'Could not load checkout
   }
 });
 
-app.post('/api/checkout/session', checkoutLimiter, optionalSessionAuth, validate(checkoutSessionBodySchema), async (req, res) => {
+app.post('/api/checkout/session', checkoutLimiter, optionalAuth, validate(checkoutSessionBodySchema), async (req, res) => {
   try {
     const config = getCheckoutConfig({
       planId: req.body.planId,
@@ -814,7 +896,7 @@ app.post('/api/checkout/session', checkoutLimiter, optionalSessionAuth, validate
   }
 });
 
-app.get('/api/billing/summary', requireSessionAuth, async (req, res) => {
+app.get('/api/billing/summary', requireAuth, async (req, res) => {
   try {
     const userId = String(req.user._id ?? req.user.id);
     const db = client.db(dbName);
@@ -1010,7 +1092,7 @@ app.get('/api/billing/summary', requireSessionAuth, async (req, res) => {
   }
 });
 
-app.get('/api/billing/history', requireSessionAuth, async (req, res) => {
+app.get('/api/billing/history', requireAuth, async (req, res) => {
   try {
     const userId = String(req.user._id ?? req.user.id);
     const db = client.db(dbName);
@@ -1065,7 +1147,7 @@ app.get('/api/billing/history', requireSessionAuth, async (req, res) => {
   }
 });
 
-app.post('/api/billing/portal', requireSessionAuth, validate(billingPortalBodySchema), async (req, res) => {
+app.post('/api/billing/portal', requireAuth, validate(billingPortalBodySchema), async (req, res) => {
   try {
     const userId = String(req.user._id ?? req.user.id);
     const db = client.db(dbName);
@@ -1384,7 +1466,7 @@ function toJobDetail(doc, isOwner, hasApplied, isSaved) {
   return job;
 }
 
-app.get('/api/dashboard', requireSessionAuth, async (req, res) => {
+app.get('/api/dashboard', requireAuth, async (req, res) => {
   try {
     const db = client.db(dbName);
     const userId = String(req.user._id ?? req.user.id);
@@ -1672,8 +1754,8 @@ const handleCreateJob = async (req, res) => {
   }
 };
 
-app.post('/api/jobs', requireSessionAuth, requireRole('recruiter', 'admin'), validate(createJobBodySchema), handleCreateJob);
-app.post('/jobs', requireSessionAuth, requireRole('recruiter', 'admin'), validate(createJobBodySchema), handleCreateJob);
+app.post('/api/jobs', requireAuth, requireRole('recruiter', 'admin'), validate(createJobBodySchema), handleCreateJob);
+app.post('/jobs', requireAuth, requireRole('recruiter', 'admin'), validate(createJobBodySchema), handleCreateJob);
 
 const handleGetJobById = async (req, res) => {
   try {
@@ -1725,7 +1807,7 @@ const handleGetJobById = async (req, res) => {
   }
 };
 
-app.get('/api/jobs/:id', validate(objectIdParamSchema), optionalSessionAuth, handleGetJobById);
+app.get('/api/jobs/:id', validate(objectIdParamSchema), optionalAuth, handleGetJobById);
 
 const handleApplyToJob = async (req, res) => {
   try {
@@ -1840,7 +1922,7 @@ const handleApplyToJob = async (req, res) => {
   }
 };
 
-app.post('/api/jobs/:id/apply', requireSessionAuth, requireRole('seeker'), validate(objectIdParamSchema), validate(applyJobBodySchema), handleApplyToJob);
+app.post('/api/jobs/:id/apply', requireAuth, requireRole('seeker'), validate(objectIdParamSchema), validate(applyJobBodySchema), handleApplyToJob);
 
 const applicationStatuses = new Set([
   'applied',
@@ -1855,7 +1937,7 @@ const applicationStatuses = new Set([
   'withdrawn',
 ]);
 
-app.patch('/api/applications/:id/status', requireSessionAuth, requireRole('recruiter', 'admin'), validate(objectIdParamSchema), validate(applicationStatusBodySchema), async (req, res) => {
+app.patch('/api/applications/:id/status', requireAuth, requireRole('recruiter', 'admin'), validate(objectIdParamSchema), validate(applicationStatusBodySchema), async (req, res) => {
   try {
     const status = req.body.status;
 
@@ -1934,7 +2016,7 @@ const handleGetSavedJobs = async (req, res) => {
   }
 };
 
-app.get('/api/saved-jobs', requireSessionAuth, handleGetSavedJobs);
+app.get('/api/saved-jobs', requireAuth, handleGetSavedJobs);
 
 const handleSaveJob = async (req, res) => {
   try {
@@ -1955,7 +2037,7 @@ const handleSaveJob = async (req, res) => {
   }
 };
 
-app.post('/api/jobs/:id/save', requireSessionAuth, requireRole('seeker'), validate(objectIdParamSchema), validate(saveJobBodySchema), handleSaveJob);
+app.post('/api/jobs/:id/save', requireAuth, requireRole('seeker'), validate(objectIdParamSchema), validate(saveJobBodySchema), handleSaveJob);
 
 const handleDeleteSavedJob = async (req, res) => {
   try {
@@ -1972,7 +2054,7 @@ const handleDeleteSavedJob = async (req, res) => {
   }
 };
 
-app.delete('/api/jobs/:id/save', requireSessionAuth, requireRole('seeker'), validate(objectIdParamSchema), handleDeleteSavedJob);
+app.delete('/api/jobs/:id/save', requireAuth, requireRole('seeker'), validate(objectIdParamSchema), handleDeleteSavedJob);
 
 const handleGetMyJobIds = async (req, res) => {
   try {
@@ -1999,7 +2081,7 @@ const handleGetMyJobIds = async (req, res) => {
   }
 };
 
-app.get('/api/applications/my-job-ids', requireSessionAuth, handleGetMyJobIds);
+app.get('/api/applications/my-job-ids', requireAuth, handleGetMyJobIds);
 
 const handleTrackActivity = async (req, res) => {
   try {
@@ -2023,9 +2105,9 @@ const handleTrackActivity = async (req, res) => {
   }
 };
 
-app.post('/api/activity/track', requireSessionAuth, validate(activityTrackBodySchema), handleTrackActivity);
+app.post('/api/activity/track', requireAuth, validate(activityTrackBodySchema), handleTrackActivity);
 
-app.post('/api/profile/avatar', requireSessionAuth, (req, res) => {
+app.post('/api/profile/avatar', requireAuth, (req, res) => {
   avatarUpload.single('avatar')(req, res, async (uploadErr) => {
     if (uploadErr) {
       if (uploadErr.code === 'LIMIT_FILE_SIZE') {

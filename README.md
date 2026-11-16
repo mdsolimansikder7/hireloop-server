@@ -25,11 +25,31 @@ Copy `.env` and fill in the values. Required variables:
 - `DB_NAME` — database name (defaults to the value used by the app).
 - `CORS_ORIGIN` — comma-separated list of frontend origins allowed to call the API, for example `http://localhost:3000,http://localhost:5173`.
 - `IMGBB_API_KEY` — ImgBB API key used by `POST /api/profile/avatar` to upload user avatars (server-side only). Leave unset in local dev to receive a 503 from that route.
+- `BETTER_AUTH_JWKS_URL` — Better Auth JWKS endpoint URL used by the server to verify JWTs (e.g. `<frontend-url>/api/auth/jwks`).
+- `JWT_ISSUER` — expected JWT issuer (`iss`) claim; must match tokens issued by Better Auth.
+- `JWT_AUDIENCE` — expected JWT audience (`aud`) claim; must match tokens issued by Better Auth.
 
 Frontend example:
 
 - React/Vite default dev server: `http://localhost:5173`
 - Next.js/CRA default: `http://localhost:3000`
+
+## JWT + session authentication
+
+Protected API routes accept either:
+- `Authorization: Bearer <jwt>` verified via Better Auth JWKS (`BETTER_AUTH_JWKS_URL`) with `JWT_ISSUER`/`JWT_AUDIENCE` checks (EdDSA, 5s clock tolerance), or
+- the existing Better Auth session cookie (fallback when no Bearer token is present).
+
+Missing/invalid/expired JWT returns `401 { "error": "Invalid or expired token" }`. Valid user with insufficient role returns `403`. JWKS is cached in module scope for serverless reuse.
+
+Example (replace `<JWT>` with a token from the frontend `authClient.token()`):
+```bash
+# Valid Bearer token
+curl -i -H "Authorization: Bearer <JWT>" https://<server>/api/billing/summary
+
+# Expired or tampered token -> expect 401 {"error":"Invalid or expired token"}
+curl -i -H "Authorization: Bearer <EXPIRED_OR_TAMPERED_JWT>" https://<server>/api/billing/summary
+```
 
 ## Stripe checkout
 
