@@ -1450,7 +1450,9 @@ app.get('/api/dashboard', requireSessionAuth, async (req, res) => {
 
 const handleGetJobs = async (req, res) => {
   try {
-    const { q, status, type, workMode, level, salaryMin, sort, page, limit } = req.query;
+   const { q, status, type, workMode, level, salaryMin, sort } = req.query;
+const page = Math.max(1, parseInt(req.query.page, 10) || 1);
+const limit = Math.min(50, Math.max(1, parseInt(req.query.limit, 10) || 10));
 
     const db = client.db(dbName);
     const jobs = await db.collection(jobsCollectionName)
