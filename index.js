@@ -27,6 +27,10 @@ const {
 
 const { version } = require('./package.json');
 
+if (!process.env.IMGBB_API_KEY) {
+  console.warn('IMGBB_API_KEY is not set');
+}
+
 const app = express();
 const PORT = process.env.PORT || 5000;
 const client = new MongoClient(process.env.MONGODB_URI || 'mongodb://localhost:27017');

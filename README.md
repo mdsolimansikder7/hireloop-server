@@ -24,6 +24,7 @@ Copy `.env` and fill in the values. Required variables:
 - `MONGODB_URI` — MongoDB connection string.
 - `DB_NAME` — database name (defaults to the value used by the app).
 - `CORS_ORIGIN` — comma-separated list of frontend origins allowed to call the API, for example `http://localhost:3000,http://localhost:5173`.
+- `IMGBB_API_KEY` — ImgBB API key used by `POST /api/profile/avatar` to upload user avatars (server-side only). Leave unset in local dev to receive a 503 from that route.
 
 Frontend example:
 
